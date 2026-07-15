@@ -26,15 +26,17 @@ workflows:
     max_build_duration: 60
     environment:
       vars:
-        # GitHub release asset with the notarized Universal 2 DMG (set to the current release).
-        SKIPPER_DMG_URL: "https://github.com/Atlantic18/SkipperArmTest/releases/download/v3.5.1.1880-arm/skipper-universal.dmg"
+        # The ONLY knob to change for a new release: the published version.
+        # Requires a GitHub release tagged v<SKIPPER_VERSION>-arm with asset skipper-universal.dmg.
+        SKIPPER_VERSION: "3.5.1.1881"
     scripts:
       - name: Download, mount and verify the universal Skipper
         script: |
           set -e
           cd ~
+          SKIPPER_DMG_URL="https://github.com/Atlantic18/SkipperArmTest/releases/download/v${SKIPPER_VERSION}-arm/skipper-universal.dmg"
           echo "=== machine ==="; uname -m; sw_vers -productVersion
-          echo "=== download DMG ==="
+          echo "=== download DMG (Skipper $SKIPPER_VERSION) ==="
           curl -L -f -o skipper.dmg "$SKIPPER_DMG_URL"
           ls -lh skipper.dmg
           echo "=== mount ==="
