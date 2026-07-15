@@ -1,21 +1,20 @@
 # Skipper — Codemagic trigger repo
 
-Malé pomocné repo, které slouží **jen jako spouštěč** buildů na Codemagicu, abychom
-mohli Skipper testovat na reálném Apple Silicon Macu (M2/M4) přes VNC. Nekompiluje se
-tu — build se stahuje hotový a jen se spouští.
+Small helper repo used **only as a build trigger** on Codemagic, so we can test Skipper on a
+real Apple Silicon Mac (M2/M4) over VNC. Nothing is compiled here — the build is downloaded
+prebuilt and just launched.
 
-## Fáze 0 — ověřit Codemagic + VNC
-`codemagic.yaml` teď obsahuje workflow `vnc-smoke-test`, které jen nastartuje Mac a drží
-ho naživu, aby se šlo připojit přes VNC a ověřit, že celá cesta funguje.
+## Phase 0 — verify Codemagic + VNC
+`codemagic.yaml` currently defines the `vnc-smoke-test` workflow, which just boots the Mac and
+keeps it alive so we can connect via VNC and confirm the whole path works.
 
-## Fáze 1 — Skipper import/export (přidá se pak)
-- stáhne Apple Silicon build Skipperu (`curl` z našeho serveru),
-- rozbalí a spustí ho,
-- necháme přes VNC naimportovat testovací model a vyexportovat výstup,
-- vyexportované soubory se posbírají jako `artifacts:` ke stažení.
+## Phase 1 — Skipper import/export (added later)
+- download the Apple Silicon Skipper build (`curl` from our server),
+- unpack and launch it,
+- over VNC, import a test model and export the output,
+- exported files are collected as `artifacts:` for download.
 
-## Napojení na Codemagic (manuální URL / "Other")
-1. Codemagic → Add application → **Other** (connect via URL).
-2. Zadat SSH URL tohoto repa.
-3. Veřejnou část vygenerovaného SSH klíče přidat do repa jako **deploy key**.
-4. Spustit build ručně, připojit se přes VNC.
+## Connecting to Codemagic (manual URL / "Other")
+1. Codemagic -> Add application -> **Other** (connect via URL).
+2. Enter the repository URL: `https://github.com/Atlantic18/SkipperArmTest.git` (public, no key needed).
+3. Start a build manually and connect over VNC.

@@ -1,11 +1,11 @@
-# Codemagic — Fáze 0: ověřit, že naběhne Apple Silicon Mac a jde na něj VNC.
+# Codemagic — Phase 0: verify that an Apple Silicon Mac boots and is reachable via VNC.
 #
-# Použití:
-#   1) V Codemagicu spustit build workflow "vnc-smoke-test" RUČNĚ (Start new build).
-#   2) Jakmile build běží, nad kroky rozbalit panel
+# Usage:
+#   1) In Codemagic, start the "vnc-smoke-test" workflow MANUALLY (Start new build).
+#   2) Once the build is running, expand the panel above the steps:
 #      "Explore build machine via SSH or VNC/RDP client".
-#   3) Připojit se RealVNC Viewerem na Host:Port + zobrazené heslo → uvidíš plochu macOS.
-#   4) Stroj drží 'sleep' naživu ~50 min; až skončíš, build zrušit (Cancel).
+#   3) Connect with RealVNC Viewer to Host:Port + the shown password -> you get the macOS desktop.
+#   4) The 'sleep' keeps the machine alive for ~50 min; cancel the build when done.
 
 workflows:
   vnc-smoke-test:
@@ -17,7 +17,7 @@ workflows:
         script: |
           echo "=== macOS build machine is up ==="
           sw_vers
-          echo "Architektura: $(uname -m)   # arm64 = reálný Apple Silicon"
-          echo "Připoj se přes panel 'Explore build machine via SSH or VNC/RDP client' nad kroky."
-          echo "Stroj poběží ~50 minut, pak se build sám ukončí."
+          echo "Architecture: $(uname -m)   # arm64 = real Apple Silicon"
+          echo "Connect via the 'Explore build machine via SSH or VNC/RDP client' panel above the steps."
+          echo "The machine will stay up for ~50 minutes, then the build ends by itself."
           sleep 3000
