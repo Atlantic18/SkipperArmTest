@@ -1,11 +1,11 @@
-# Codemagic — Phase 0: verify that an Apple Silicon Mac boots and is reachable via VNC.
+# Codemagic trigger repo for testing Skipper on a real Apple Silicon Mac over VNC.
+# Two workflows:
+#   vnc-smoke-test    - Phase 0: just boot a Mac and keep it alive to verify VNC works.
+#   skipper-arm-smoke - Phase 1: download the Universal 2 Skipper DMG, mount it, verify the
+#                       arm64 slice + signature, then keep the machine alive so you can launch
+#                       Skipper.app over VNC and check native arm64 launch + license + import/export.
 #
-# Usage:
-#   1) In Codemagic, start the "vnc-smoke-test" workflow MANUALLY (Start new build).
-#   2) Once the build is running, expand the panel above the steps:
-#      "Explore build machine via SSH or VNC/RDP client".
-#   3) Connect with RealVNC Viewer to Host:Port + the shown password -> you get the macOS desktop.
-#   4) The 'sleep' keeps the machine alive for ~50 min; cancel the build when done.
+# Run manually with "Enable SSH/VNC access" ticked, then connect with RealVNC Viewer.
 
 workflows:
   vnc-smoke-test:
@@ -18,6 +18,41 @@ workflows:
           echo "=== macOS build machine is up ==="
           sw_vers
           echo "Architecture: $(uname -m)   # arm64 = real Apple Silicon"
-          echo "Connect via the 'Explore build machine via SSH or VNC/RDP client' panel above the steps."
-          echo "The machine will stay up for ~50 minutes, then the build ends by itself."
           sleep 3000
+
+  skipper-arm-smoke:
+    name: Skipper Universal 2 arm64 smoke test
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      vars:
+        # GitHub release asset with the notarized Universal 2 DMG (set to the current release).
+        SKIPPER_DMG_URL: "https://github.com/Atlantic18/SkipperArmTest/releases/download/v3.5.1.1880-arm/skipper-universal.dmg"
+    scripts:
+      - name: Download, mount and verify the universal Skipper
+        script: |
+          set -e
+          cd ~
+          echo "=== machine ==="; uname -m; sw_vers -productVersion
+          echo "=== download DMG ==="
+          curl -L -f -o skipper.dmg "$SKIPPER_DMG_URL"
+          ls -lh skipper.dmg
+          echo "=== mount ==="
+          hdiutil attach skipper.dmg -mountpoint /Volumes/SkipperMount -nobrowse
+          APP=$(find /Volumes/SkipperMount -maxdepth 1 -name 'Skipper.app' | head -1)
+          echo "App in DMG: $APP"
+          cp -R "$APP" ~/Desktop/Skipper.app
+          hdiutil detach /Volumes/SkipperMount
+          BIN=~/Desktop/Skipper.app/Contents/MacOS/Skipper
+          echo "=== architectures ==="; lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q arm64 && echo "ARM64 SLICE PRESENT" || { echo "NO ARM64 SLICE"; exit 1; }
+          echo "=== code signature ==="; codesign -dvv ~/Desktop/Skipper.app 2>&1 | head -6 || true
+          echo "=== gatekeeper assessment ==="; spctl -a -vvv -t exec ~/Desktop/Skipper.app 2>&1 | head -4 || true
+      - name: Keep machine alive for VNC
+        script: |
+          echo "Skipper.app is on the Desktop."
+          echo "Connect via VNC, launch it, then verify:"
+          echo "  1) Activity Monitor -> Kind = 'Apple' (native arm64, not 'Intel'/Rosetta)"
+          echo "  2) license dialog appears (GUI runs)"
+          echo "  3) import a test model, export, inspect the output"
+          sleep 3200
