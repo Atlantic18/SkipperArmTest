@@ -26,17 +26,23 @@ workflows:
     max_build_duration: 60
     environment:
       vars:
-        # The ONLY knob to change for a new release: the published version.
-        # Requires a GitHub release tagged v<SKIPPER_VERSION>-arm with asset skipper-universal.dmg.
+        # The ONLY knob to change for a new release: the published version (a release tag in the
+        # Skipper repo). The script resolves the macOS .dmg asset from the release itself, so the
+        # exact asset filename (which carries the build's macOS version) does not need updating.
         SKIPPER_VERSION: "3.5.1.1881"
+        SKIPPER_REPO: "Atlantic18/Skipper"
     scripts:
       - name: Download, mount and verify the universal Skipper
         script: |
           set -e
           cd ~
-          SKIPPER_DMG_URL="https://github.com/Atlantic18/SkipperArmTest/releases/download/v${SKIPPER_VERSION}-arm/skipper-universal.dmg"
           echo "=== machine ==="; uname -m; sw_vers -productVersion
-          echo "=== download DMG (Skipper $SKIPPER_VERSION) ==="
+          echo "=== resolve macOS .dmg in $SKIPPER_REPO release $SKIPPER_VERSION ==="
+          SKIPPER_DMG_URL=$(curl -sL "https://api.github.com/repos/${SKIPPER_REPO}/releases/tags/${SKIPPER_VERSION}" \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); print(next(a['browser_download_url'] for a in r['assets'] if a['name'].endswith('.dmg')))")
+          [ -z "$SKIPPER_DMG_URL" ] && { echo "ERROR: no .dmg asset in release $SKIPPER_VERSION"; exit 1; }
+          echo "DMG: $SKIPPER_DMG_URL"
+          echo "=== download ==="
           curl -L -f -o skipper.dmg "$SKIPPER_DMG_URL"
           ls -lh skipper.dmg
           echo "=== mount ==="
