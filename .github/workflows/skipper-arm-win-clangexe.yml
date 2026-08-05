@@ -1,0 +1,151 @@
+# Test a clang-built Skipper.exe against the ALREADY clang-built Qt, on real ARM64 hardware.
+#
+# The theory being tested: the remaining 0xC0000005 is a C++ ABI mismatch across the clang/MSVC
+# boundary, not a miscompilation. Qt (clang) calls back into our QObjects during the GFS decrypt
+# script, and several of our functions return QScriptValue BY VALUE; on AArch64 that comes back
+# through a hidden pointer which MSVC also mirrors into x0 while clang does not. Crash register
+# state matched: ldr w8,[x26] with x26 = 0.
+#
+# Rather than rebuild the whole package, this drops a clang-built Skipper.exe / SkipperCli.exe over
+# an installed MSVC package. Everything else - Qt, the vcpkg DLLs, Skipper.gfs, the resources - stays
+# exactly as shipped, so the compiler of ONE binary is the only variable.
+#
+#   crash gone      -> ABI boundary confirmed; converting the rest of the tree is the fix
+#   crash unchanged -> not ABI; the fault is inside JavaScriptCore's generated code
+name: skipper-arm-win-clangexe
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version of the base package
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding the base installer and the clang binaries
+        required: true
+        default: "arm-test-3.5.1.1884"
+      asset:
+        description: Zip with the clang-built executables
+        required: true
+        default: "skipper-clang-arm64.zip"
+
+jobs:
+  clangexe:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Install the base package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer.exe "$base/Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          "installed OK"
+
+      - name: Swap in the clang-built executables
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o clang.zip "$base/$env:ASSET"
+          if ($LASTEXITCODE -ne 0) { throw "clang build download failed" }
+          Expand-Archive clang.zip -DestinationPath clang -Force
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+
+          # SkipperCli.exe is the same image with the PE subsystem set to console. The deploy config
+          # does that with <pe-set-subsystem>; here the console copy is made the same way so the CLI
+          # probe keeps working: subsystem lives at PE header + 24 + 68, value 3 = console.
+          $exe = Get-ChildItem clang -Recurse -Filter 'Skipper.exe' | Select-Object -First 1
+          if (-not $exe) { throw "Skipper.exe not in the zip" }
+          Copy-Item $exe.FullName (Join-Path $dir 'Skipper.exe')    -Force
+          Copy-Item $exe.FullName (Join-Path $dir 'SkipperCli.exe') -Force
+
+          $fs = [IO.File]::Open((Join-Path $dir 'SkipperCli.exe'), 'Open', 'ReadWrite')
+          $br = New-Object IO.BinaryReader($fs); $bw = New-Object IO.BinaryWriter($fs)
+          $fs.Position = 0x3C; $pe = $br.ReadInt32()
+          $fs.Position = $pe + 24 + 68; $bw.Write([UInt16]3)
+          $fs.Close()
+
+          foreach ($n in 'Skipper.exe','SkipperCli.exe') {
+            $f = Join-Path $dir $n
+            $s = [IO.File]::OpenRead($f); $b = New-Object IO.BinaryReader($s)
+            $s.Position = 0x3C; $p = $b.ReadInt32()
+            $s.Position = $p + 4; $mach = $b.ReadUInt16()
+            $s.Position = $p + 24 + 68; $sub = $b.ReadUInt16()
+            $b.Close()
+            "{0,-16} machine=0x{1:X4} subsystem={2}  {3:N1} MB" -f $n, $mach, $sub, ((Get-Item $f).Length/1MB)
+            if ($mach -ne 0xAA64) { throw "$n is not ARM64" }
+          }
+          # Any PDB shipped alongside makes the post-mortem readable.
+          Get-ChildItem clang -Recurse -Filter '*.pdb' | ForEach-Object { Copy-Item $_.FullName $dir -Force; "pdb: $($_.Name)" }
+
+      - name: Probes
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 20
+        env:
+          KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          # Unlicensed first: an activated licence leaks into later runs on the same machine and
+          # would silently turn a "no licence" probe into a licensed one.
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $dumpDir = Join-Path $env:LOCALAPPDATA 'Skipper\dumps'
+          function Probe($label, $exe, $argv) {
+            Remove-Item "$dumpDir\*" -Recurse -Force -EA SilentlyContinue
+            "";  "========== $label =========="
+            & (Join-Path $dir $exe) @argv
+            "---> exit $LASTEXITCODE (0x{0:X8})" -f $LASTEXITCODE
+            $d = Get-ChildItem $dumpDir -Filter *.dmp -Recurse -EA SilentlyContinue |
+                   Sort-Object LastWriteTime | Select-Object -Last 1
+            if ($d) { "     minidump: $($d.Name)"; Copy-Item $d.FullName "$label.dmp" -EA SilentlyContinue }
+          }
+          Probe 'cli-unlicensed' 'SkipperCli.exe' @('-cli-list-orm-attributes')
+          Probe 'cli-licensed'   'SkipperCli.exe' @('-license-key', $env:KEY, '-cli-list-orm-attributes')
+          Probe 'selfcheck'      'Skipper.exe'    @('--self-check')
+          Probe 'cli-help'       'SkipperCli.exe' @('-cli-help')
+
+      - name: Stack of anything that still crashed
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $dumps = Get-ChildItem *.dmp -EA SilentlyContinue
+          if (-not $dumps) { "no crash dumps - nothing left to explain"; return }
+          $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers','C:\Program Files\Windows Kits\10\Debuggers' `
+                   -Recurse -Filter cdb.exe -EA SilentlyContinue | Select-Object -First 1
+          if (-not $cdb) { "cdb missing"; return }
+          $syms = "$env:GITHUB_WORKSPACE\Installed"
+          foreach ($d in $dumps) {
+            "";  "===== $($d.Name) ====="
+            & $cdb.FullName -z $d.FullName -y $syms -c '.reload /f; .ecxr; r; kb 40; q' 2>&1 |
+              Select-String -Pattern 'Skipper|Qt5|ExceptionCode|ldr |str ' | Select-Object -First 30 |
+              ForEach-Object { $_.Line.Trim() }
+          }
+
+      - name: Give the activation slot back
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $cli = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
+          if (Test-Path $cli) { & $cli -license-unregister; "unregister exit $LASTEXITCODE" }
+
+      - name: Collect
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-clangexe
+          path: "*.dmp"
+          if-no-files-found: ignore
