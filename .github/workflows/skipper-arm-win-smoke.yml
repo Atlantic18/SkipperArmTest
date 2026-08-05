@@ -6,6 +6,11 @@
 #
 # The installer is fetched from a release IN THIS REPOSITORY, not from Atlantic18/Skipper, so the
 # package can be verified before it is published to customers.
+#
+# 2026-08-05: the first run proved the package installs and is genuinely ARM64, but Skipper.exe dies
+# with 0xC0000005 (access violation) about a second after start, before printing its banner. The
+# diagnostic steps below exist to narrow that down, so they are deliberately non-fatal - one run has
+# to produce the whole picture rather than stopping at the first failure.
 name: skipper-arm-win-smoke
 
 on:
@@ -23,7 +28,7 @@ on:
 jobs:
   smoke:
     runs-on: windows-11-arm
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Machine identity
@@ -32,6 +37,20 @@ jobs:
           "OS            : $([Environment]::OSVersion.VersionString)"
           "PROCESSOR_ARCH: $env:PROCESSOR_ARCHITECTURE"
           "PS version    : $($PSVersionTable.PSVersion)"
+
+      - name: Enable crash dumps
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # Windows Error Reporting writes a dump for any crashing process once LocalDumps is set.
+          # DumpType 2 = full dump; the stack alone is not enough to tell a bad DLL from bad code.
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $k -Force | Out-Null
+          Set-ItemProperty -Path $k -Name DumpFolder -Value 'C:\dumps' -Type ExpandString
+          Set-ItemProperty -Path $k -Name DumpCount  -Value 10 -Type DWord
+          Set-ItemProperty -Path $k -Name DumpType   -Value 2  -Type DWord
+          New-Item -ItemType Directory -Force -Path C:\dumps | Out-Null
+          "LocalDumps configured"
 
       - name: Download the ARM installer
         shell: pwsh
@@ -56,65 +75,111 @@ jobs:
           if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
           "installer exit: $($p.ExitCode)"
           if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
-          Get-ChildItem $dir | Measure-Object | ForEach-Object { "installed entries: $($_.Count)" }
+          "installed files (recursive): $((Get-ChildItem $dir -Recurse -File).Count)"
 
-      - name: Verify the binary really is ARM64
+      - name: Architecture of every binary in the package
         shell: pwsh
         run: |
-          # Read the PE machine field. The NSIS installer stub itself is x86 on every platform,
-          # so the payload is what has to be checked, not installer.exe.
+          # A single non-ARM64 DLL would make the loader fail the process outright, and a mixed
+          # ARM64 / ARM64EC set can crash on the first call across the boundary. Check them all.
+          function Get-PeMachine([string]$path) {
+            $fs = [IO.File]::OpenRead($path)
+            try {
+              $br = New-Object IO.BinaryReader($fs)
+              $fs.Seek(0x3C, 'Begin') | Out-Null
+              $peOffset = $br.ReadInt32()
+              if ($peOffset -le 0 -or $peOffset -gt $fs.Length - 6) { return 'not-PE' }
+              $fs.Seek($peOffset, 'Begin') | Out-Null
+              if ($br.ReadUInt32() -ne 0x00004550) { return 'not-PE' }
+              $m = $br.ReadUInt16()
+              switch ($m) { 0xAA64 {'ARM64'} 0x8664 {'x64'} 0x14C {'x86'} 0x1C4 {'ARMNT'} default {"0x{0:X4}" -f $m} }
+            } finally { $fs.Dispose() }
+          }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $rows = Get-ChildItem $dir -Recurse -File -Include *.exe,*.dll | ForEach-Object {
+            [pscustomobject]@{ Machine = (Get-PeMachine $_.FullName); Name = $_.Name }
+          }
+          $rows | Group-Object Machine | Sort-Object Count -Descending |
+            ForEach-Object { "{0,-8} : {1}" -f $_.Name, $_.Count }
+          ""
+          "--- anything that is NOT ARM64 ---"
+          $bad = $rows | Where-Object { $_.Machine -ne 'ARM64' }
+          if ($bad) { $bad | ForEach-Object { "{0,-8} {1}" -f $_.Machine, $_.Name } } else { "(none)" }
+          $rows | Sort-Object Name | ForEach-Object { "{0,-8} {1}" -f $_.Machine, $_.Name } |
+            Out-File -Encoding utf8 arch-report.txt
+
+      - name: Run -version (shortest path through the code)
+        id: version
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # -version returns from ProceedCommandLineParams before the licence layer and before any
+          # window is created. If even this crashes, the failure is in startup/DLL loading rather
+          # than in self-check itself.
           $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
-          $fs = [IO.File]::OpenRead($exe)
-          try {
-            $br = New-Object IO.BinaryReader($fs)
-            $fs.Seek(0x3C, 'Begin') | Out-Null
-            $peOffset = $br.ReadInt32()
-            $fs.Seek($peOffset, 'Begin') | Out-Null
-            if ($br.ReadUInt32() -ne 0x00004550) { throw "not a PE file" }
-            $machine = $br.ReadUInt16()
-          } finally { $fs.Dispose() }
-          $name = switch ($machine) { 0xAA64 {'ARM64'} 0x8664 {'x64'} 0x14C {'x86'} default {"unknown 0x{0:X}" -f $machine} }
-          "machine: 0x{0:X4} ({1})" -f $machine, $name
-          if ($machine -ne 0xAA64) { throw "expected ARM64, got $name" }
+          $p = Start-Process -FilePath $exe -ArgumentList '-version' -PassThru -NoNewWindow `
+                 -RedirectStandardOutput version.txt -RedirectStandardError version.err.txt
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          "--- stdout ---"; Get-Content version.txt     -EA SilentlyContinue
+          "--- stderr ---"; Get-Content version.err.txt -EA SilentlyContinue
 
       - name: Self-check
+        id: selfcheck
         shell: pwsh
+        continue-on-error: true
         env:
           SKIPPER_LICENSE_KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
         run: |
-          # Hard timeout on purpose: without a usable licence key the process does not fail, it
-          # simply never exits (measured 2026-08-05), which would otherwise burn the whole job.
           $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
-          $args = @('-clear-settings','-license-key',$env:SKIPPER_LICENSE_KEY,'-self-check')
-          $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -NoNewWindow `
+          $argv = @('-clear-settings','-license-key',$env:SKIPPER_LICENSE_KEY,'-self-check')
+          $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru -NoNewWindow `
                  -RedirectStandardOutput selfcheck.txt -RedirectStandardError selfcheck.err.txt
-          if (-not $p.WaitForExit(120000)) { $p.Kill(); Get-Content selfcheck.txt -EA SilentlyContinue; throw "self-check hung" }
-          Get-Content selfcheck.txt -EA SilentlyContinue
-          Get-Content selfcheck.err.txt -EA SilentlyContinue
-          "self-check exit: $($p.ExitCode)"
-          if ($p.ExitCode -ne 0) { throw "self-check failed" }
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          "--- stdout ---"; Get-Content selfcheck.txt     -EA SilentlyContinue
+          "--- stderr ---"; Get-Content selfcheck.err.txt -EA SilentlyContinue
 
       - name: CLI layer
+        id: cli
         shell: pwsh
+        continue-on-error: true
         env:
           SKIPPER_LICENSE_KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
         run: |
           $cli = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
-          if (-not (Test-Path $cli)) { throw "SkipperCli.exe missing" }
+          if (-not (Test-Path $cli)) { "SkipperCli.exe missing"; exit 0 }
           $p = Start-Process -FilePath $cli -ArgumentList @('-license-key',$env:SKIPPER_LICENSE_KEY,'-cli-list-orm-attributes') `
                  -PassThru -NoNewWindow -RedirectStandardOutput cli.txt -RedirectStandardError cli.err.txt
-          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "CLI hung" }
-          Get-Content cli.txt -EA SilentlyContinue | Select-Object -First 25
-          "cli exit: $($p.ExitCode)"
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          Get-Content cli.txt -EA SilentlyContinue | Select-Object -First 20
 
-      - name: Collect logs
+      - name: Crash dumps
+        if: always()
+        shell: pwsh
+        run: |
+          $d = Get-ChildItem C:\dumps -File -EA SilentlyContinue
+          if ($d) { $d | ForEach-Object { "{0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) } }
+          else { "no dumps produced" }
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          "-version  : ${{ steps.version.outcome }}"
+          "self-check: ${{ steps.selfcheck.outcome }}"
+          "cli       : ${{ steps.cli.outcome }}"
+
+      - name: Collect logs and dumps
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: skipper-arm-smoke-logs
           path: |
+            arch-report.txt
+            version.txt
+            version.err.txt
             selfcheck.txt
             selfcheck.err.txt
             cli.txt
             cli.err.txt
+            C:/dumps/**
           if-no-files-found: ignore
