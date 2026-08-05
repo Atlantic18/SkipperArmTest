@@ -65,6 +65,31 @@ jobs:
           if (-not $p.WaitForExit(60000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
           Get-Content gui.txt, gui.err.txt -EA SilentlyContinue
 
+
+      # Same RELEASE Qt as above, only the test program is unoptimized. The crash is inside
+      # Qt5Core.dll, so this is expected to change nothing - it is the control for the next step.
+      - name: Run qtmin-gui-od (QApplication, app built /Od, RELEASE Qt)
+        id: guiod
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'qtmin\qtmin-gui-od.exe'
+          $p = Start-Process $exe -PassThru -NoNewWindow -RedirectStandardOutput guiod.txt -RedirectStandardError guiod.err.txt
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          Get-Content guiod.txt, guiod.err.txt -EA SilentlyContinue
+
+      # The decisive one: DEBUG Qt is built without optimization. If this succeeds while the release
+      # Qt crashes, the fault is the optimizer; if it crashes too, the code or configuration is wrong.
+      - name: Run qtmin-gui-debug (QApplication, DEBUG Qt - no optimization)
+        id: guidebug
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'qtmin\qtmin-gui-debug.exe'
+          $p = Start-Process $exe -PassThru -NoNewWindow -RedirectStandardOutput guidebug.txt -RedirectStandardError guidebug.err.txt
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          Get-Content guidebug.txt, guidebug.err.txt -EA SilentlyContinue
+
       - name: Stack trace for whichever variant crashed
         if: always()
         shell: pwsh
@@ -89,6 +114,8 @@ jobs:
         run: |
           "qtmin-core (QCoreApplication): ${{ steps.core.outcome }}"
           "qtmin-gui  (QApplication)    : ${{ steps.gui.outcome }}"
+          "qtmin-gui-od  (release Qt, app /Od): ${{ steps.guiod.outcome }}"
+          "qtmin-gui-dbg (DEBUG Qt)          : ${{ steps.guidebug.outcome }}"
 
       - name: Collect
         if: always()
