@@ -30,8 +30,13 @@ workflows:
         # (only when the Jenkins macOS build agent's OS changes — it is baked into the asset name).
         # The DMG is fetched by its direct release URL; the GitHub API is intentionally NOT used —
         # its unauthenticated rate limit is exhausted on Codemagic's shared IPs.
-        SKIPPER_VERSION: "3.5.1.1881"
-        SKIPPER_MAC_LABEL: "MacOS-15.7-64bit"
+        #
+        # The label carries the architecture since 3.5.1.1883: release artifacts are named
+        # Skipper-<version>-<OS>-<osversion>-<arch>-<bits>bit.<ext>, and the macOS build is a
+        # Universal 2 binary, hence "universal". Releases up to 3.5.1.1882 have no arch segment
+        # ("MacOS-15.7-64bit"), so pinning an older version needs the old label too.
+        SKIPPER_VERSION: "3.5.1.1883"
+        SKIPPER_MAC_LABEL: "MacOS-15.7-universal-64bit"
     scripts:
       - name: Download, mount and verify the universal Skipper
         script: |

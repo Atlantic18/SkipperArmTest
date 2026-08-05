@@ -1,0 +1,120 @@
+# Smoke-test the Windows-on-ARM Skipper package on real ARM64 hardware.
+#
+# GitHub's windows-11-arm hosted runner is free ONLY in public repositories - in a private repo the
+# label does not resolve and the job fails immediately. This repository is public for exactly that
+# reason, the same way it is public for the Codemagic macOS ARM test in codemagic.yaml.
+#
+# The installer is fetched from a release IN THIS REPOSITORY, not from Atlantic18/Skipper, so the
+# package can be verified before it is published to customers.
+name: skipper-arm-win-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version to test
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag in THIS repository holding the ARM installer
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  smoke:
+    runs-on: windows-11-arm
+    timeout-minutes: 20
+
+    steps:
+      - name: Machine identity
+        shell: pwsh
+        run: |
+          "OS            : $([Environment]::OSVersion.VersionString)"
+          "PROCESSOR_ARCH: $env:PROCESSOR_ARCHITECTURE"
+          "PS version    : $($PSVersionTable.PSVersion)"
+
+      - name: Download the ARM installer
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $asset = "Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          $url   = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$asset"
+          "Downloading $url"
+          curl.exe -L -f -o installer.exe $url
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          "{0:N1} MB" -f ((Get-Item installer.exe).Length / 1MB)
+
+      - name: Install silently
+        shell: pwsh
+        run: |
+          # /INSTDIR is passed on purpose. A silent install WITHOUT it does nothing in a
+          # non-interactive session, because the NSIS UAC plugin cannot elevate there.
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          "installer exit: $($p.ExitCode)"
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          Get-ChildItem $dir | Measure-Object | ForEach-Object { "installed entries: $($_.Count)" }
+
+      - name: Verify the binary really is ARM64
+        shell: pwsh
+        run: |
+          # Read the PE machine field. The NSIS installer stub itself is x86 on every platform,
+          # so the payload is what has to be checked, not installer.exe.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          $fs = [IO.File]::OpenRead($exe)
+          try {
+            $br = New-Object IO.BinaryReader($fs)
+            $fs.Seek(0x3C, 'Begin') | Out-Null
+            $peOffset = $br.ReadInt32()
+            $fs.Seek($peOffset, 'Begin') | Out-Null
+            if ($br.ReadUInt32() -ne 0x00004550) { throw "not a PE file" }
+            $machine = $br.ReadUInt16()
+          } finally { $fs.Dispose() }
+          $name = switch ($machine) { 0xAA64 {'ARM64'} 0x8664 {'x64'} 0x14C {'x86'} default {"unknown 0x{0:X}" -f $machine} }
+          "machine: 0x{0:X4} ({1})" -f $machine, $name
+          if ($machine -ne 0xAA64) { throw "expected ARM64, got $name" }
+
+      - name: Self-check
+        shell: pwsh
+        env:
+          SKIPPER_LICENSE_KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          # Hard timeout on purpose: without a usable licence key the process does not fail, it
+          # simply never exits (measured 2026-08-05), which would otherwise burn the whole job.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          $args = @('-clear-settings','-license-key',$env:SKIPPER_LICENSE_KEY,'-self-check')
+          $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -NoNewWindow `
+                 -RedirectStandardOutput selfcheck.txt -RedirectStandardError selfcheck.err.txt
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); Get-Content selfcheck.txt -EA SilentlyContinue; throw "self-check hung" }
+          Get-Content selfcheck.txt -EA SilentlyContinue
+          Get-Content selfcheck.err.txt -EA SilentlyContinue
+          "self-check exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "self-check failed" }
+
+      - name: CLI layer
+        shell: pwsh
+        env:
+          SKIPPER_LICENSE_KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          $cli = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
+          if (-not (Test-Path $cli)) { throw "SkipperCli.exe missing" }
+          $p = Start-Process -FilePath $cli -ArgumentList @('-license-key',$env:SKIPPER_LICENSE_KEY,'-cli-list-orm-attributes') `
+                 -PassThru -NoNewWindow -RedirectStandardOutput cli.txt -RedirectStandardError cli.err.txt
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "CLI hung" }
+          Get-Content cli.txt -EA SilentlyContinue | Select-Object -First 25
+          "cli exit: $($p.ExitCode)"
+
+      - name: Collect logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-smoke-logs
+          path: |
+            selfcheck.txt
+            selfcheck.err.txt
+            cli.txt
+            cli.err.txt
+          if-no-files-found: ignore
