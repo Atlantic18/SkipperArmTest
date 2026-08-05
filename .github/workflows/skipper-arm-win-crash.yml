@@ -105,14 +105,22 @@ jobs:
       #   arm64-> 0xC0000005
       # Same machine, same argument, so the architecture is the only variable. It is the no-licence
       # error path, which is why it survived every earlier test unnoticed.
-      - name: Stack of the -cli-list-orm-attributes crash
+      - name: Stack of the SkipperCli.exe crash
         shell: pwsh
         continue-on-error: true
         timeout-minutes: 8
         run: |
-          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          # SkipperCli.exe without a licence is the cheapest reproduction the grid found: no licence,
+          # no network, no activation slot, and it still dies with 0xC0000005. The same command on
+          # Skipper.exe (GUI subsystem) exits 0 with a clean envelope, and BOTH work on x86-64.
+          #
+          # _NO_DEBUG_HEAP matters: a debugger normally gives the child the debug heap, whose extra
+          # bookkeeping hides exactly the kind of heap damage suspected here. An earlier run without
+          # it produced no fault at all, which is a false negative, not a passing test.
+          $env:_NO_DEBUG_HEAP = '1'
+          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
           $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
-          $cmds = '.reload /f; g; .lastevent; .ecxr; r; kb 60; !analyze -v; q'
+          $cmds = '.reload /f; g; .lastevent; .ecxr; r; kb 60; ~*kb 20; !analyze -v; q'
           & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -cli-list-orm-attributes 2>&1 |
             Tee-Object -FilePath cdb-cli.log
           "--- exit $LASTEXITCODE ---"
@@ -130,7 +138,7 @@ jobs:
             Select-String -Path $file -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|SYMBOL_NAME|STACK_COMMAND|Skipper!|ax[A-Z]|Qt5|Qtitan|libcrypto|libssl|libmysql|libpq|breakpad|ntdll!Nt|KERNELBASE!' |
               Select-Object -First 80 | ForEach-Object { $_.Line.Trim() }
           }
-          Show 'cdb-cli.log'       'CRASH  (-cli-list-orm-attributes)  <- the real ARM difference'
+          Show 'cdb-cli.log'       'CRASH  (SkipperCli.exe -cli-list-orm-attributes)  <- the real ARM bug'
           Show 'cdb-selfcheck.log' 'CRASH  (-self-check)'
           Show 'cdb-hang.log'      'HANG   (-version)'
 
