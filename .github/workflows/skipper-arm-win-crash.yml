@@ -1,0 +1,122 @@
+# Get a symbolized stack trace for the 0xC0000005 crash of the ARM64 Skipper build.
+#
+# Established by skipper-arm-win-smoke:
+#   - the package installs on real ARM64 hardware and every shipped binary IS ARM64
+#     (55/55; the only x86 file is Uninstall.exe, which is the NSIS uninstaller and belongs there)
+#   - Skipper.exe dies with 0xC0000005 about a second after start, for -version, -self-check and the
+#     CLI alike, printing nothing at all - so the fault is in startup, not in application logic
+#   - Windows Error Reporting LocalDumps produced no dump in this environment
+#
+# So this workflow attaches a debugger instead. cdb prints the stack straight into the log; procdump
+# is the fallback and leaves a dump to analyse offline.
+name: skipper-arm-win-crash
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version to test
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag in THIS repository holding the ARM installer and symbols
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  crash:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Install the package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer.exe "$base/Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          "installed OK"
+
+      - name: Fetch symbols
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o symbols.zip "$base/symbols-pdb-arm-64-all.zip"
+          if ($LASTEXITCODE -ne 0) { throw "symbol download failed" }
+          Expand-Archive symbols.zip -DestinationPath symbols -Force
+          Get-ChildItem symbols -Recurse -Filter *.pdb | ForEach-Object { "  {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+
+      - name: Locate a debugger
+        id: dbg
+        shell: pwsh
+        run: |
+          $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers','C:\Program Files\Windows Kits\10\Debuggers' `
+                   -Recurse -Filter cdb.exe -EA SilentlyContinue | Select-Object -First 1
+          if ($cdb) {
+            "found: $($cdb.FullName)"
+            "cdb=$($cdb.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+          } else {
+            "cdb not present - falling back to procdump"
+            curl.exe -L -f -o procdump.zip https://download.sysinternals.com/files/Procdump.zip
+            Expand-Archive procdump.zip -DestinationPath procdump -Force
+            Get-ChildItem procdump | ForEach-Object { "  $($_.Name)" }
+            "cdb=" | Out-File -Append $env:GITHUB_OUTPUT
+          }
+
+      - name: Stack trace via cdb
+        if: steps.dbg.outputs.cdb != ''
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # -g  : ignore the initial breakpoint
+          # -G  : ignore the process-exit breakpoint
+          # g   : run until the exception hits, then dump context, stack and analysis
+          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
+          $cmds = '.symfix; .sympath+ ' + $syms + '; .reload /f; g; .lastevent; r; kb 40; !analyze -v; lm; q'
+          & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -version 2>&1 |
+            Tee-Object -FilePath cdb.log
+          "--- exit $LASTEXITCODE ---"
+
+      - name: Dump via procdump
+        if: steps.dbg.outputs.cdb == ''
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $pd = Get-ChildItem procdump -Filter 'procdump64a.exe' -EA SilentlyContinue | Select-Object -First 1
+          if (-not $pd) { $pd = Get-ChildItem procdump -Filter 'procdump.exe' | Select-Object -First 1 }
+          "using $($pd.Name)"
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          New-Item -ItemType Directory -Force -Path dumps | Out-Null
+          & $pd.FullName -accepteula -e -ma -x dumps $exe -version 2>&1 | Tee-Object -FilePath procdump.log
+          Get-ChildItem dumps -EA SilentlyContinue | ForEach-Object { "  {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+
+      - name: Key lines from the stack
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path cdb.log) {
+            "===== exception / faulting frame ====="
+            Select-String -Path cdb.log -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|STACK_COMMAND|SYMBOL_NAME|Skipper!|Qt5|Qtitan|breakpad|crash' |
+              Select-Object -First 60 | ForEach-Object { $_.Line.Trim() }
+          } else { "no cdb.log" }
+
+      - name: Collect everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-crash
+          path: |
+            cdb.log
+            procdump.log
+            dumps/**
+          if-no-files-found: ignore
