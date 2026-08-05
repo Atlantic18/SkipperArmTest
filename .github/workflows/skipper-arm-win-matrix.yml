@@ -1,0 +1,121 @@
+# Isolate what actually differs between the ARM64 and x86-64 packages.
+#
+# The earlier comparison was not a fair one and produced a wrong conclusion, so this run fixes it.
+# Three variables were being changed at once:
+#
+#   architecture   arm64 native            vs  x86-64 under emulation
+#   executable     Skipper.exe             vs  SkipperCli.exe, which is the SAME binary copied and
+#                                              then rewritten to the console subsystem by
+#                                              <pe-set-subsystem> in the deploy config
+#   licence        none (-> modal dialog)  vs  -license-key <KEY>
+#
+# The smoke test ran SkipperCli.exe WITH a key and got 0xC0000005; the control ran Skipper.exe
+# WITHOUT a key and got a clean JSON envelope. Any of the three could explain that.
+#
+# This job installs both packages side by side on one ARM runner and walks the full grid, so each
+# variable can be read off on its own.
+name: skipper-arm-win-matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version to test
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding both installers
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  matrix:
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+
+    steps:
+      - name: Install both packages
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          foreach ($p in @(
+              @{ file = "Skipper-$env:VERSION-Windows-all-arm-64bit.exe"; dir = 'Arm'; machine = 0xAA64 },
+              @{ file = "Skipper-$env:VERSION-Windows-all-x86-64bit.exe"; dir = 'X64'; machine = 0x8664 })) {
+            curl.exe -L -f -o inst.exe "$base/$($p.file)"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $($p.file)" }
+            $dir = Join-Path $env:GITHUB_WORKSPACE $p.dir
+            $proc = Start-Process -FilePath .\inst.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+            if (-not $proc.WaitForExit(300000)) { $proc.Kill(); throw "installer hung: $($p.file)" }
+            foreach ($exe in @('Skipper.exe','SkipperCli.exe')) {
+              $full = Join-Path $dir $exe
+              if (-not (Test-Path $full)) { throw "$exe missing in $($p.dir)" }
+              # Read the PE header rather than trusting the package name. SkipperCli.exe is produced
+              # by rewriting the subsystem field of a copy, so its header is worth checking too:
+              # subsystem 2 = GUI, 3 = console.
+              $fs = [IO.File]::OpenRead($full); $br = New-Object IO.BinaryReader($fs)
+              $fs.Position = 0x3C; $pe = $br.ReadInt32()
+              $fs.Position = $pe + 4;  $mach = $br.ReadUInt16()
+              $fs.Position = $pe + 24 + 68; $sub = $br.ReadUInt16()
+              $br.Close()
+              "{0,-4} {1,-16} machine=0x{2:X4} subsystem={3}" -f $p.dir, $exe, $mach, $sub
+              if ($mach -ne $p.machine) { throw "$exe in $($p.dir) is 0x$('{0:X4}' -f $mach)" }
+            }
+          }
+
+      - name: Walk the grid
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          function Run($label, $exe, $argv, $seconds = 90) {
+            $tag = $label -replace '[^A-Za-z0-9]','_'
+            $out = "$tag.out.txt"; $err = "$tag.err.txt"
+            $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru `
+                   -RedirectStandardOutput $out -RedirectStandardError $err
+            if ($p.WaitForExit($seconds * 1000)) {
+              $code = $p.ExitCode
+              $verdict = if ($code -eq 0) { 'OK' } elseif ($code -eq -1073741819) { 'CRASH 0xC0000005' } else { "exit $code" }
+            } else { $p.Kill(); $verdict = "HUNG ${seconds}s" }
+            # A crash AFTER the envelope is printed means the verb itself worked and only teardown
+            # failed - a completely different bug from one that never produces output at all.
+            $text = (Get-Content $out -Raw -EA SilentlyContinue)
+            $json = if ($text -match '\{"status"') { 'json:yes' } else { 'json:NO ' }
+            "{0,-46} {1,-9} {2}" -f $label, $json, $verdict
+          }
+
+          "";  "=========== -cli-list-orm-attributes ==========="
+          foreach ($arch in @('Arm','X64')) {
+            foreach ($exe in @('Skipper.exe','SkipperCli.exe')) {
+              $full = Join-Path $env:GITHUB_WORKSPACE "$arch\$exe"
+              Run "$arch $exe  no-licence"  $full @('-cli-list-orm-attributes')
+              Run "$arch $exe  -license-key" $full @('-license-key', $env:KEY, '-cli-list-orm-attributes')
+            }
+          }
+
+          "";  "=========== --self-check (needs a licence, else it sits on the dialog) ==========="
+          foreach ($arch in @('Arm','X64')) {
+            $full = Join-Path $env:GITHUB_WORKSPACE "$arch\Skipper.exe"
+            Run "$arch Skipper.exe  -license-key" $full @('-clear-settings','-license-key', $env:KEY, '--self-check') 120
+          }
+
+      - name: Output of every cell
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem *.out.txt -EA SilentlyContinue | ForEach-Object {
+            "";  "===== $($_.Name) ====="
+            Get-Content $_.FullName -EA SilentlyContinue | Select-Object -First 12
+          }
+
+      - name: Collect everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-matrix
+          path: "*.txt"
+          if-no-files-found: ignore
