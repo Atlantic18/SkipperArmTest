@@ -98,6 +98,25 @@ jobs:
           "--- stderr so far ---"
           Get-Content version-err.txt -EA SilentlyContinue
 
+      # ---------------------------------------------------------------- the REAL ARM diff ---
+      # Everything else on this page turned out to be the licence dialog, which the x86-64 package
+      # hits identically on this same runner. This probe is the one thing that genuinely differs:
+      #   x64  -> exit 0 and a clean {"code":"MISSING_REQUIRED"} JSON envelope
+      #   arm64-> 0xC0000005
+      # Same machine, same argument, so the architecture is the only variable. It is the no-licence
+      # error path, which is why it survived every earlier test unnoticed.
+      - name: Stack of the -cli-list-orm-attributes crash
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
+          $cmds = '.reload /f; g; .lastevent; .ecxr; r; kb 60; !analyze -v; q'
+          & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -cli-list-orm-attributes 2>&1 |
+            Tee-Object -FilePath cdb-cli.log
+          "--- exit $LASTEXITCODE ---"
+
       # ---------------------------------------------------------------- readable summary ----
       - name: Key frames
         if: always()
@@ -111,6 +130,7 @@ jobs:
             Select-String -Path $file -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|SYMBOL_NAME|STACK_COMMAND|Skipper!|ax[A-Z]|Qt5|Qtitan|libcrypto|libssl|libmysql|libpq|breakpad|ntdll!Nt|KERNELBASE!' |
               Select-Object -First 80 | ForEach-Object { $_.Line.Trim() }
           }
+          Show 'cdb-cli.log'       'CRASH  (-cli-list-orm-attributes)  <- the real ARM difference'
           Show 'cdb-selfcheck.log' 'CRASH  (-self-check)'
           Show 'cdb-hang.log'      'HANG   (-version)'
 
@@ -120,6 +140,7 @@ jobs:
         with:
           name: skipper-arm-crash
           path: |
+            cdb-cli.log
             cdb-selfcheck.log
             cdb-hang.log
             version-out.txt
