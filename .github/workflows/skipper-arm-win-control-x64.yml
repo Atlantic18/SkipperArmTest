@@ -1,0 +1,86 @@
+# Control experiment: run the x86-64 package on the SAME ARM runner, under emulation.
+#
+# Why this matters more than another stack trace. The arm64 build now gets as far as
+# "Initialization of application context" and then either hangs or dies with 0xC0000005. The very
+# next thing the application does is InitApplicationControllers(), whose first real work is
+# InitializeLicense() - a Stark server round trip over libcurl/OpenSSL. A fresh CI machine has no
+# license, no cached activation and no guarantee that stark.inventic.eu is reachable from it.
+#
+# So there are two competing explanations for the SECOND failure, and they need different fixes:
+#   ARM-specific   - miscompiled or non-portable code, only reproducible on arm64
+#   environmental  - unlicensed machine / blocked network, would equally affect x64
+#
+# Windows on ARM runs x64 binaries under emulation, so the same runner can execute the x86-64
+# package unchanged. If the x64 package hangs and crashes here in exactly the same place, the fault
+# is NOT in the ARM build and no amount of recompiling with clang would fix it.
+name: skipper-arm-win-control-x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version to test
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding the installers
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  control:
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+
+    steps:
+      - name: Install the x86-64 package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer-x64.exe "$base/Skipper-$env:VERSION-Windows-all-x86-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'InstalledX64'
+          $p = Start-Process -FilePath .\installer-x64.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          # Prove the emulation assumption instead of trusting it: 0x8664 is x64, 0xAA64 is ARM64.
+          $fs = [IO.File]::OpenRead((Join-Path $dir 'Skipper.exe'))
+          $br = New-Object IO.BinaryReader($fs)
+          $fs.Position = 0x3C; $pe = $br.ReadInt32(); $fs.Position = $pe + 4
+          $machine = $br.ReadUInt16(); $br.Close()
+          "Skipper.exe machine = 0x{0:X4} ({1})" -f $machine, @{0x8664='x64';0xAA64='ARM64';0x14C='x86'}[[int]$machine]
+          if ($machine -ne 0x8664) { throw "expected an x64 binary, got 0x$('{0:X4}' -f $machine)" }
+
+      - name: Run the same three probes
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 12
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'InstalledX64\Skipper.exe'
+          function Probe($name, $argv) {
+            "";  "========== $name =========="
+            $out = "$name-out.txt"; $err = "$name-err.txt"
+            $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru `
+                   -RedirectStandardOutput $out -RedirectStandardError $err
+            if ($p.WaitForExit(60000)) {
+              "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode
+            } else {
+              $p.Kill(); "RESULT: hung"
+            }
+            "--- stdout ---"; Get-Content $out -EA SilentlyContinue
+            "--- stderr ---"; Get-Content $err -EA SilentlyContinue
+          }
+          Probe 'version'    @('-version')
+          Probe 'selfcheck'  @('--self-check')
+          Probe 'cli'        @('-cli-list-orm-attributes')
+
+      - name: Collect everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-control-x64
+          path: "*-out.txt"
+          if-no-files-found: ignore
