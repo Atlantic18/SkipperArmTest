@@ -1,0 +1,121 @@
+# Run a LICENSED Skipper on real ARM64 hardware.
+#
+# Why a license is needed at all. The unlicensed smoke test can only prove that the process starts:
+# InitApplicationControllers() calls InitializeLicense(), finds nothing, and hands over to
+# CApplicationLicenseGuiHandler::onLicenseMissing(), which opens a modal QDialog. On a CI machine
+# nobody closes it, so the run looks like a hang. That was measured, not guessed - the attached
+# debugger showed the main thread sitting in QDialog::exec under onLicenseMissing, painting buttons.
+#
+# -license-activate is the ONLY command that skips license initialization (see
+# CLlmCliMain::ShouldSkipLicenseInit), which is exactly what makes it usable as the first step here.
+#
+# The key comes from a repository secret, never from the source. Secrets are not exposed to
+# workflows triggered from forked pull requests, so a public repository is still safe for this.
+#
+# ACTIVATION SLOTS: every runner is a brand new machine and burns one activation. The cleanup step
+# runs with if:always() and unregisters, so a failed or cancelled run still gives the slot back.
+name: skipper-arm-win-licensed
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version to test
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding the ARM installer
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  licensed:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Check the secret is configured
+        shell: pwsh
+        run: |
+          if (-not "${{ secrets.SKIPPER_LICENSE_KEY }}") {
+            throw "SKIPPER_LICENSE_KEY is not set in the repository secrets"
+          }
+          "secret present"
+
+      - name: Install the ARM package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer.exe "$base/Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          "installed OK"
+
+      - name: Activate the license
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          # The key travels through the environment, not the command line, so it never appears in
+          # the process list; the JSON envelope Skipper prints does not echo it back either.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '-license-activate', $env:KEY -PassThru `
+                 -RedirectStandardOutput act-out.txt -RedirectStandardError act-err.txt
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "activation hung" }
+          "activation exit: $($p.ExitCode)"
+          Get-Content act-out.txt -EA SilentlyContinue
+          Get-Content act-err.txt -EA SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "activation failed" }
+
+      - name: Probes that need a valid license
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          function Probe($name, $argv, $seconds = 90) {
+            "";  "========== $name =========="
+            $out = "$name-out.txt"; $err = "$name-err.txt"
+            $p = Start-Process -FilePath $exe -ArgumentList $argv -PassThru `
+                   -RedirectStandardOutput $out -RedirectStandardError $err
+            if ($p.WaitForExit($seconds * 1000)) {
+              "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode
+            } else {
+              $p.Kill(); "RESULT: hung after $seconds s"
+            }
+            "--- stdout ---"; Get-Content $out -EA SilentlyContinue | Select-Object -First 60
+            "--- stderr ---"; Get-Content $err -EA SilentlyContinue | Select-Object -First 30
+          }
+          Probe 'license-info' @('-license-info')
+          Probe 'version'      @('-version')
+          Probe 'selfcheck'    @('--self-check')
+          Probe 'cli-help'     @('-cli-help')
+          Probe 'orm-attrs'    @('-cli-list-orm-attributes')
+
+      - name: Give the activation slot back
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
+          if (-not (Test-Path $exe)) { "nothing installed, nothing to unregister"; return }
+          $p = Start-Process -FilePath $exe -ArgumentList '-license-unregister' -PassThru `
+                 -RedirectStandardOutput unreg-out.txt -RedirectStandardError unreg-err.txt
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); "unregister hung - THE SLOT IS STILL TAKEN" }
+          else { "unregister exit: $($p.ExitCode)" }
+          Get-Content unreg-out.txt -EA SilentlyContinue
+          Get-Content unreg-err.txt -EA SilentlyContinue
+
+      - name: Collect everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-licensed
+          path: "*-out.txt"
+          if-no-files-found: ignore
