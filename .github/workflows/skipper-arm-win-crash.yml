@@ -67,27 +67,13 @@ jobs:
           "found: $($cdb.FullName)"
           "cdb=$($cdb.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
 
-      # ---------------------------------------------------------------- the CRASH -----------
-      - name: Stack of the -self-check crash
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          # -g/-G: ignore the initial and the process-exit breakpoint, so the run is unattended.
-          # -y   : symbol path. Never also pass .sympath+ inside -c - that command eats the rest of
-          #        the line, semicolons included, and every later command silently becomes path.
-          # .ecxr: switch to the EXCEPTION context. Without it kb prints the stack of the debugger
-          #        break, not of the fault, which is what makes an unsymbolized trace look useless.
-          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
-          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
-          $cmds = '.reload /f; g; .lastevent; .ecxr; r; kb 60; ~*kb 30; !analyze -v; lm; q'
-          & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -self-check 2>&1 |
-            Tee-Object -FilePath cdb-selfcheck.log
-          "--- exit $LASTEXITCODE ---"
-
       # ---------------------------------------------------------------- the HANG ------------
+      # This one runs FIRST because it cannot wedge: the process runs WITHOUT a debugger and is
+      # attached to only after a fixed wait, so the step always terminates and always yields data.
       - name: Stack of the -version hang
         shell: pwsh
         continue-on-error: true
+        timeout-minutes: 8
         run: |
           # -version wedges AFTER printing the banner, so there is no exception to catch. Start it
           # normally, give it long enough to reach the stuck state, then attach and ask every thread
