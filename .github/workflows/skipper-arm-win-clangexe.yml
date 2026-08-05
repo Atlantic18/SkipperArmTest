@@ -87,6 +87,12 @@ jobs:
             "{0,-16} machine=0x{1:X4} subsystem={2}  {3:N1} MB" -f $n, $mach, $sub, ((Get-Item $f).Length/1MB)
             if ($mach -ne 0xAA64) { throw "$n is not ARM64" }
           }
+          # DLLs in the zip replace their installed counterparts - that is how a rebuilt Qt5Script
+          # gets tested without rebuilding and reinstalling the whole package.
+          Get-ChildItem clang -Recurse -Filter '*.dll' | ForEach-Object {
+            Copy-Item $_.FullName $dir -Force
+            "dll: {0}  {1:N2} MB" -f $_.Name, ($_.Length/1MB)
+          }
           # Any PDB shipped alongside makes the post-mortem readable.
           Get-ChildItem clang -Recurse -Filter '*.pdb' | ForEach-Object { Copy-Item $_.FullName $dir -Force; "pdb: $($_.Name)" }
 
