@@ -1,14 +1,16 @@
-# Get a symbolized stack trace for the 0xC0000005 crash of the ARM64 Skipper build.
+# Locate the REMAINING ARM64 failure, after clang-built Qt fixed the first one.
 #
-# Established by skipper-arm-win-smoke:
-#   - the package installs on real ARM64 hardware and every shipped binary IS ARM64
-#     (55/55; the only x86 file is Uninstall.exe, which is the NSIS uninstaller and belongs there)
-#   - Skipper.exe dies with 0xC0000005 about a second after start, for -version, -self-check and the
-#     CLI alike, printing nothing at all - so the fault is in startup, not in application logic
-#   - Windows Error Reporting LocalDumps produced no dump in this environment
+# History, all measured on this runner (real ARM64 hardware):
+#   1. Qt built with MSVC cl.exe  -> Skipper died instantly with 0xC0000005 inside
+#      Qt5Core!QObjectPrivate::addConnection, printing nothing at all. The MSVC ARM64 optimizer
+#      miscompiles Qt (QTBUG-101473); -O1 was not enough, only /Od worked.
+#   2. Qt rebuilt with clang-cl   -> Skipper now prints its banner, loads Qt 5.15.19 and reaches
+#      "Initialization of application context". So Qt is fixed. What is left is a DIFFERENT fault,
+#      further along, in code still compiled by MSVC (Skipper itself, the ax* libs, vcpkg libs).
 #
-# So this workflow attaches a debugger instead. cdb prints the stack straight into the log; procdump
-# is the fallback and leaves a dump to analyse offline.
+# The two surviving symptoms need two different probes, which is what this workflow runs:
+#   -version    HANGS  -> start it, let it wedge, then attach and print every thread's stack
+#   -self-check CRASHES-> run it under cdb from the start and print the faulting stack
 name: skipper-arm-win-crash
 
 on:
@@ -61,58 +63,70 @@ jobs:
         run: |
           $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers','C:\Program Files\Windows Kits\10\Debuggers' `
                    -Recurse -Filter cdb.exe -EA SilentlyContinue | Select-Object -First 1
-          if ($cdb) {
-            "found: $($cdb.FullName)"
-            "cdb=$($cdb.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-          } else {
-            "cdb not present - falling back to procdump"
-            curl.exe -L -f -o procdump.zip https://download.sysinternals.com/files/Procdump.zip
-            Expand-Archive procdump.zip -DestinationPath procdump -Force
-            Get-ChildItem procdump | ForEach-Object { "  $($_.Name)" }
-            "cdb=" | Out-File -Append $env:GITHUB_OUTPUT
-          }
+          if (-not $cdb) { throw "cdb not present on this image" }
+          "found: $($cdb.FullName)"
+          "cdb=$($cdb.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: Stack trace via cdb
-        if: steps.dbg.outputs.cdb != ''
+      # ---------------------------------------------------------------- the CRASH -----------
+      - name: Stack of the -self-check crash
         shell: pwsh
         continue-on-error: true
         run: |
-          # -g  : ignore the initial breakpoint
-          # -G  : ignore the process-exit breakpoint
-          # -y  : symbol path. Do NOT also put .sympath+ into -c: that command swallows the entire
-          #       rest of the line, semicolons included, so every following command would silently
-          #       become part of the search path and never execute.
-          # lmDvm: which Qt5Widgets copies are loaded and where from - the first run showed the DLL
-          #       mapped twice, which on its own can explain a crash inside QObject::connect.
+          # -g/-G: ignore the initial and the process-exit breakpoint, so the run is unattended.
+          # -y   : symbol path. Never also pass .sympath+ inside -c - that command eats the rest of
+          #        the line, semicolons included, and every later command silently becomes path.
+          # .ecxr: switch to the EXCEPTION context. Without it kb prints the stack of the debugger
+          #        break, not of the fault, which is what makes an unsymbolized trace look useless.
           $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
           $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
-          $cmds = '.reload /f; g; .lastevent; r; kb 40; ~*k; !analyze -v; lmDvm Qt5*; lm; q'
-          & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -version 2>&1 |
-            Tee-Object -FilePath cdb.log
+          $cmds = '.reload /f; g; .lastevent; .ecxr; r; kb 60; ~*kb 30; !analyze -v; lm; q'
+          & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -self-check 2>&1 |
+            Tee-Object -FilePath cdb-selfcheck.log
           "--- exit $LASTEXITCODE ---"
 
-      - name: Dump via procdump
-        if: steps.dbg.outputs.cdb == ''
+      # ---------------------------------------------------------------- the HANG ------------
+      - name: Stack of the -version hang
         shell: pwsh
         continue-on-error: true
         run: |
-          $pd = Get-ChildItem procdump -Filter 'procdump64a.exe' -EA SilentlyContinue | Select-Object -First 1
-          if (-not $pd) { $pd = Get-ChildItem procdump -Filter 'procdump.exe' | Select-Object -First 1 }
-          "using $($pd.Name)"
+          # -version wedges AFTER printing the banner, so there is no exception to catch. Start it
+          # normally, give it long enough to reach the stuck state, then attach and ask every thread
+          # where it is. A hang shows up as one thread parked in a wait while nothing progresses.
           $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
-          New-Item -ItemType Directory -Force -Path dumps | Out-Null
-          & $pd.FullName -accepteula -e -ma -x dumps $exe -version 2>&1 | Tee-Object -FilePath procdump.log
-          Get-ChildItem dumps -EA SilentlyContinue | ForEach-Object { "  {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB) }
+          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
+          $p = Start-Process -FilePath $exe -ArgumentList '-version' -PassThru `
+                 -RedirectStandardOutput version-out.txt -RedirectStandardError version-err.txt
+          Start-Sleep -Seconds 25
+          if ($p.HasExited) {
+            "process already exited with $($p.ExitCode) - no hang to attach to"
+          } else {
+            "still running as pid $($p.Id), attaching"
+            # !locks/!cs need the CRT lock lists, which are not always there; the thread stacks are
+            # the part that always works, so they come first and the rest is best effort.
+            & "${{ steps.dbg.outputs.cdb }}" -p $p.Id -y $syms -c '.reload /f; ~*kb 40; !locks; q' 2>&1 |
+              Tee-Object -FilePath cdb-hang.log
+            if (-not $p.HasExited) { $p.Kill() }
+          }
+          "--- stdout so far ---"
+          Get-Content version-out.txt -EA SilentlyContinue
+          "--- stderr so far ---"
+          Get-Content version-err.txt -EA SilentlyContinue
 
-      - name: Key lines from the stack
+      # ---------------------------------------------------------------- readable summary ----
+      - name: Key frames
         if: always()
         shell: pwsh
         run: |
-          if (Test-Path cdb.log) {
-            "===== exception / faulting frame ====="
-            Select-String -Path cdb.log -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|STACK_COMMAND|SYMBOL_NAME|Skipper!|Qt5|Qtitan|breakpad|crash' |
-              Select-Object -First 60 | ForEach-Object { $_.Line.Trim() }
-          } else { "no cdb.log" }
+          function Show($file, $title) {
+            if (-not (Test-Path $file)) { "no $file"; return }
+            "";  "===== $title ====="
+            # Our own frames are what identifies the culprit module; the exception header gives the
+            # address and code. Everything else in a cdb log is noise for this purpose.
+            Select-String -Path $file -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|SYMBOL_NAME|STACK_COMMAND|Skipper!|ax[A-Z]|Qt5|Qtitan|libcrypto|libssl|libmysql|libpq|breakpad|ntdll!Nt|KERNELBASE!' |
+              Select-Object -First 80 | ForEach-Object { $_.Line.Trim() }
+          }
+          Show 'cdb-selfcheck.log' 'CRASH  (-self-check)'
+          Show 'cdb-hang.log'      'HANG   (-version)'
 
       - name: Collect everything
         if: always()
@@ -120,7 +134,8 @@ jobs:
         with:
           name: skipper-arm-crash
           path: |
-            cdb.log
-            procdump.log
-            dumps/**
+            cdb-selfcheck.log
+            cdb-hang.log
+            version-out.txt
+            version-err.txt
           if-no-files-found: ignore
