@@ -1,0 +1,105 @@
+# Decide whether the ARM64 crash belongs to Qt or to Skipper.
+#
+# Skipper dies in Qt5Core!QObjectPrivate::addConnection, reached straight from the QApplication
+# constructor, before a single line of our own code runs:
+#
+#   Skipper!main -> CApplicationSkipper::ctor -> CApplication::ctor -> CAtomixApplicationQtApp::ctor
+#     -> Qt5Widgets!QApplication::QApplication -> QApplicationPrivate::init
+#     -> Qt5Core!QCoreApplicationPrivate::init -> QObject::connectImpl -> addConnection  == 0xC0000005
+#
+# qtmin does nothing but construct that object, and is compiled WITHOUT /GL while Skipper and Qt both
+# use link-time code generation. Two variants isolate the layer:
+#   qtmin-core.exe -> QCoreApplication (Qt5Core only)
+#   qtmin-gui.exe  -> QApplication     (Qt5Widgets -> Qt5Gui -> Qt5Core)
+#
+# Reading the outcome:
+#   both crash            -> the Qt ARM64 build is broken, Skipper is not involved
+#   only the GUI crashes  -> the fault is in Qt5Widgets/Qt5Gui, QtCore is fine
+#   neither crashes       -> Qt is fine and the fault is in how Skipper is built (LTCG the prime suspect)
+name: skipper-arm-qtmin
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag holding qtmin.zip
+        required: true
+        default: "arm-test-3.5.1.1884"
+
+jobs:
+  qtmin:
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+
+    steps:
+      - name: Fetch the test package
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o qtmin.zip "$base/qtmin.zip"
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Expand-Archive qtmin.zip -DestinationPath qtmin -Force
+          curl.exe -L -f -o symbols.zip "$base/symbols-pdb-arm-64-all.zip"
+          Expand-Archive symbols.zip -DestinationPath symbols -Force
+          "package files: $((Get-ChildItem qtmin -Recurse -File).Count)"
+
+      - name: Run qtmin-core (QCoreApplication)
+        id: core
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'qtmin\qtmin-core.exe'
+          $p = Start-Process $exe -PassThru -NoNewWindow -RedirectStandardOutput core.txt -RedirectStandardError core.err.txt
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          Get-Content core.txt, core.err.txt -EA SilentlyContinue
+
+      - name: Run qtmin-gui (QApplication)
+        id: gui
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'qtmin\qtmin-gui.exe'
+          $p = Start-Process $exe -PassThru -NoNewWindow -RedirectStandardOutput gui.txt -RedirectStandardError gui.err.txt
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); "RESULT: hung" } else { "RESULT: exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode }
+          Get-Content gui.txt, gui.err.txt -EA SilentlyContinue
+
+      - name: Stack trace for whichever variant crashed
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers','C:\Program Files\Windows Kits\10\Debuggers' `
+                   -Recurse -Filter cdb.exe -EA SilentlyContinue | Select-Object -First 1
+          if (-not $cdb) { "cdb not available"; exit 0 }
+          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\qtmin"
+          # No .sympath+ in -c: it swallows the rest of the line, semicolons included.
+          $cmds = '.reload /f; g; .lastevent; r; kb 40; q'
+          foreach ($v in 'core','gui') {
+            "=============== qtmin-$v ==============="
+            & $cdb.FullName -g -G -y $syms -c $cmds (Join-Path $env:GITHUB_WORKSPACE "qtmin\qtmin-$v.exe") 2>&1 |
+              Tee-Object -FilePath "cdb-$v.log" | Select-String -Pattern 'Access violation|ExceptionCode|qtmin!|Qt5Core!|Qt5Widgets!|Qt5Gui!|SUCCESS|step ' |
+              Select-Object -First 30 | ForEach-Object { $_.Line.Trim() }
+          }
+
+      - name: Verdict
+        if: always()
+        shell: pwsh
+        run: |
+          "qtmin-core (QCoreApplication): ${{ steps.core.outcome }}"
+          "qtmin-gui  (QApplication)    : ${{ steps.gui.outcome }}"
+
+      - name: Collect
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-qtmin
+          path: |
+            core.txt
+            core.err.txt
+            gui.txt
+            gui.err.txt
+            cdb-core.log
+            cdb-gui.log
+          if-no-files-found: ignore
