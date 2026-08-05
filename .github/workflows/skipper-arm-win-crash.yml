@@ -139,27 +139,49 @@ jobs:
       - name: Crash it for real and read the minidump
         shell: pwsh
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 15
+        env:
+          KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
         run: |
+          # ORDER MATTERS AND IS THE POINT. An earlier grid ran its cells back to back on one machine
+          # and a -license-key cell left an ACTIVATED licence behind, so every later "no licence" cell
+          # silently ran WITH one. That is what produced the bogus reading that SkipperCli.exe crashes
+          # on its own; run first and unattended, it prints its envelope and exits 0.
+          #
+          # So: unlicensed first (must pass), then licensed (expected to crash). The licensed run is
+          # the one that goes deeper into the code, and every ARM cell that crashed had a licence.
           $dumpDir = Join-Path $env:LOCALAPPDATA 'Skipper\dumps'
-          Remove-Item "$dumpDir\*" -Force -EA SilentlyContinue
-          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
-
-          "===== running unattended, output inherited ====="
-          & $exe -cli-list-orm-attributes
-          $code = $LASTEXITCODE
-          "===== exit $code (0x{0:X8}) =====" -f $code
-
-          $dumps = Get-ChildItem $dumpDir -Filter *.dmp -EA SilentlyContinue
-          if (-not $dumps) { "no minidump in $dumpDir"; return }
-          $dump = $dumps | Sort-Object LastWriteTime | Select-Object -Last 1
-          "minidump: {0}  {1:N1} MB" -f $dump.Name, ($dump.Length/1MB)
-
+          $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
           $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
-          & "${{ steps.dbg.outputs.cdb }}" -z $dump.FullName -y $syms `
-            -c '.reload /f; .ecxr; r; kb 60; ~*kb 20; !analyze -v; q' 2>&1 |
-            Tee-Object -FilePath cdb-postmortem.log
-          Copy-Item $dump.FullName . -EA SilentlyContinue
+
+          function Attempt($label, $argv) {
+            Remove-Item "$dumpDir\*" -Force -Recurse -EA SilentlyContinue
+            "";  "===== $label ====="
+            # Output is inherited, never redirected to a file: a redirected stdout is block buffered
+            # and a crash throws the buffer away, which reads as "produced nothing at all".
+            & $exe @argv
+            "===== exit $LASTEXITCODE (0x{0:X8}) =====" -f $LASTEXITCODE
+            $d = Get-ChildItem $dumpDir -Filter *.dmp -Recurse -EA SilentlyContinue |
+                   Sort-Object LastWriteTime | Select-Object -Last 1
+            if (-not $d) { "no minidump"; return }
+            "minidump: {0}  {1:N1} MB" -f $d.Name, ($d.Length/1MB)
+            $log = "cdb-postmortem.log"
+            & "${{ steps.dbg.outputs.cdb }}" -z $d.FullName -y $syms `
+              -c '.reload /f; .ecxr; r; kb 60; ~*kb 20; !analyze -v; q' 2>&1 |
+              Tee-Object -FilePath $log -Append
+            Copy-Item $d.FullName "$label.dmp" -EA SilentlyContinue
+          }
+
+          Attempt 'unlicensed' @('-cli-list-orm-attributes')
+          Attempt 'licensed'   @('-license-key', $env:KEY, '-cli-list-orm-attributes')
+
+      - name: Give the activation slot back
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
+          if (Test-Path $exe) { & $exe -license-unregister; "unregister exit $LASTEXITCODE" }
 
       # ---------------------------------------------------------------- readable summary ----
       - name: Key frames
