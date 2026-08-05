@@ -79,10 +79,14 @@ jobs:
         run: |
           # -g  : ignore the initial breakpoint
           # -G  : ignore the process-exit breakpoint
-          # g   : run until the exception hits, then dump context, stack and analysis
+          # -y  : symbol path. Do NOT also put .sympath+ into -c: that command swallows the entire
+          #       rest of the line, semicolons included, so every following command would silently
+          #       become part of the search path and never execute.
+          # lmDvm: which Qt5Widgets copies are loaded and where from - the first run showed the DLL
+          #       mapped twice, which on its own can explain a crash inside QObject::connect.
           $exe  = Join-Path $env:GITHUB_WORKSPACE 'Installed\Skipper.exe'
           $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
-          $cmds = '.symfix; .sympath+ ' + $syms + '; .reload /f; g; .lastevent; r; kb 40; !analyze -v; lm; q'
+          $cmds = '.reload /f; g; .lastevent; r; kb 40; ~*k; !analyze -v; lmDvm Qt5*; lm; q'
           & "${{ steps.dbg.outputs.cdb }}" -g -G -y $syms -c $cmds $exe -version 2>&1 |
             Tee-Object -FilePath cdb.log
           "--- exit $LASTEXITCODE ---"
