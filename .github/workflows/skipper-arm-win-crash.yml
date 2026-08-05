@@ -125,6 +125,42 @@ jobs:
             Tee-Object -FilePath cdb-cli.log
           "--- exit $LASTEXITCODE ---"
 
+      # ------------------------------------------------- post-mortem, the only thing that works --
+      # Live debugging is a dead end for this one: under cdb the very same command prints its JSON
+      # envelope and exits 0, with or without _NO_DEBUG_HEAP. So catch it after the fact instead.
+      #
+      # Breakpad already writes a minidump - the smoke log shows it launching the CrashReporter with
+      # -dump-directory "C:\Users\runneradmin\AppData\Local\Skipper\dumps". Earlier runs reported "no
+      # dumps produced" only because they looked in C:\dumps.
+      #
+      # Output goes straight to the console here, not through -RedirectStandardOutput: a redirected
+      # stdout is block buffered, so a crash discards whatever was still in the buffer and the run
+      # looks like it produced nothing. Inheriting the runner console shows how far it really got.
+      - name: Crash it for real and read the minidump
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $dumpDir = Join-Path $env:LOCALAPPDATA 'Skipper\dumps'
+          Remove-Item "$dumpDir\*" -Force -EA SilentlyContinue
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
+
+          "===== running unattended, output inherited ====="
+          & $exe -cli-list-orm-attributes
+          $code = $LASTEXITCODE
+          "===== exit $code (0x{0:X8}) =====" -f $code
+
+          $dumps = Get-ChildItem $dumpDir -Filter *.dmp -EA SilentlyContinue
+          if (-not $dumps) { "no minidump in $dumpDir"; return }
+          $dump = $dumps | Sort-Object LastWriteTime | Select-Object -Last 1
+          "minidump: {0}  {1:N1} MB" -f $dump.Name, ($dump.Length/1MB)
+
+          $syms = "$env:GITHUB_WORKSPACE\symbols;$env:GITHUB_WORKSPACE\Installed"
+          & "${{ steps.dbg.outputs.cdb }}" -z $dump.FullName -y $syms `
+            -c '.reload /f; .ecxr; r; kb 60; ~*kb 20; !analyze -v; q' 2>&1 |
+            Tee-Object -FilePath cdb-postmortem.log
+          Copy-Item $dump.FullName . -EA SilentlyContinue
+
       # ---------------------------------------------------------------- readable summary ----
       - name: Key frames
         if: always()
@@ -138,7 +174,8 @@ jobs:
             Select-String -Path $file -Pattern 'ExceptionAddress|ExceptionCode|FAULTING_IP|MODULE_NAME|IMAGE_NAME|SYMBOL_NAME|STACK_COMMAND|Skipper!|ax[A-Z]|Qt5|Qtitan|libcrypto|libssl|libmysql|libpq|breakpad|ntdll!Nt|KERNELBASE!' |
               Select-Object -First 80 | ForEach-Object { $_.Line.Trim() }
           }
-          Show 'cdb-cli.log'       'CRASH  (SkipperCli.exe -cli-list-orm-attributes)  <- the real ARM bug'
+          Show 'cdb-postmortem.log' 'POST-MORTEM  (SkipperCli.exe minidump)  <- the real ARM bug'
+          Show 'cdb-cli.log'       'live cdb (does not reproduce)'
           Show 'cdb-selfcheck.log' 'CRASH  (-self-check)'
           Show 'cdb-hang.log'      'HANG   (-version)'
 
@@ -148,9 +185,10 @@ jobs:
         with:
           name: skipper-arm-crash
           path: |
+            cdb-postmortem.log
             cdb-cli.log
-            cdb-selfcheck.log
             cdb-hang.log
+            "*.dmp"
             version-out.txt
             version-err.txt
           if-no-files-found: ignore
