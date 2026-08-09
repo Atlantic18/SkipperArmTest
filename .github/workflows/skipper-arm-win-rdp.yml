@@ -119,27 +119,63 @@ jobs:
           TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
           NGROK_TOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
+          $ErrorActionPreference = 'Stop'
           if ('${{ inputs.tunnel }}' -eq 'tailscale') {
             curl.exe -L -f -o ts.msi "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi"
             if ($LASTEXITCODE -ne 0) { throw "tailscale download failed" }
+            "downloaded {0:N1} MB" -f ((Get-Item ts.msi).Length/1MB)
             Start-Process msiexec.exe -ArgumentList '/i','ts.msi','/quiet','/norestart' -Wait
-            $ts = 'C:\Program Files\Tailscale\tailscale.exe'
-            & $ts up --authkey=$env:TS_KEY --hostname=skipper-arm-runner --accept-routes
-            Start-Sleep 5
-            $ip = (& $ts ip -4) -join ''
+
+            # The MSI registers the service but does not necessarily leave it running, and a
+            # `tailscale up` issued before tailscaled is listening just reports "state: NoState"
+            # without failing - which is exactly how the first attempt lost 40 seconds and the job.
+            $svc = $null
+            foreach ($i in 1..30) {
+              $svc = Get-Service Tailscale -EA SilentlyContinue
+              if ($svc) { break }
+              Start-Sleep 2
+            }
+            if (-not $svc) { throw "Tailscale service never appeared after install" }
+            if ($svc.Status -ne 'Running') { Start-Service Tailscale; Start-Sleep 3 }
+            "service: $((Get-Service Tailscale).Status)"
+
+            $ts = 'C:\Program Files\Tailscale	ailscale.exe'
+            if (-not (Test-Path $ts)) { throw "tailscale.exe not found after install" }
+
+            # Keep the output: an expired or already-used auth key only shows up here.
+            $up = & $ts up --authkey=$env:TS_KEY --hostname=skipper-arm-runner --accept-routes 2>&1
+            "tailscale up exit=$LASTEXITCODE"
+            $up | ForEach-Object { "  $_" }
+
+            # Joining the tailnet is not instant; poll instead of sleeping a fixed amount.
+            $ip = ''
+            foreach ($i in 1..30) {
+              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep 3
+            }
+            if ($ip -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+              & $ts status 2>&1 | ForEach-Object { "  $_" }
+              throw "no Tailscale IP after 90s - check whether the auth key is valid and unused"
+            }
             "CONNECT TO: $ip   (tailscale hostname: skipper-arm-runner)"
             "addr=$ip" | Out-File -Append $env:GITHUB_OUTPUT
           } else {
             curl.exe -L -f -o ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip"
             if ($LASTEXITCODE -ne 0) { throw "ngrok download failed" }
             Expand-Archive ngrok.zip -DestinationPath ngrok -Force
-            $ng = "$PWD\ngrok\ngrok.exe"
+            $ng = "$PWD
+grok
+grok.exe"
             & $ng config add-authtoken $env:NGROK_TOKEN
             Start-Process $ng -ArgumentList 'tcp','3389','--log','stdout' -RedirectStandardOutput ngrok.log -WindowStyle Hidden
-            Start-Sleep 8
-            # The public address is only available from ngrok's local API.
-            $t = (Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url
-            $addr = $t -replace '^tcp://',''
+            $addr = ''
+            foreach ($i in 1..20) {
+              Start-Sleep 3
+              try { $addr = ((Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url) -replace '^tcp://','' } catch {}
+              if ($addr) { break }
+            }
+            if (-not $addr) { Get-Content ngrok.log -EA SilentlyContinue; throw "ngrok gave no public address" }
             "CONNECT TO: $addr"
             "addr=$addr" | Out-File -Append $env:GITHUB_OUTPUT
           }
