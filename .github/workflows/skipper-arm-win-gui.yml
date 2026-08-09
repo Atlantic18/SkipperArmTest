@@ -158,7 +158,9 @@ jobs:
           else { "top-level windows: $($w.Count)"; $w | ForEach-Object { "  $_" } }
 
       - name: Screenshot
-        shell: pwsh
+        # Windows PowerShell, not pwsh: under PowerShell 7 an Add-Type referencing System.Drawing
+        # fails with CS1069 (the type moved to System.Drawing.Common). 5.1 has it in the box.
+        shell: powershell
         continue-on-error: true
         run: |
           # TWO images on purpose. The full-desktop grab is the obvious one, but this runner boots
