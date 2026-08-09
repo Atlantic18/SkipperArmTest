@@ -243,16 +243,48 @@ jobs:
 
       - name: Hold the session open
         shell: pwsh
+        env:
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          # Just keeps the job alive. A heartbeat every 5 minutes so the log shows it is healthy and
-          # how much time is left.
+          # THE TUNNEL IS (RE)STARTED HERE, NOT IN THE STEP ABOVE.
+          #
+          # A process started by a step does not survive that step - the runner tears the step's
+          # process tree down when it finishes. The previous layout started ngrok in "Start the
+          # tunnel", printed the address, and the tunnel then died the moment that step ended: the
+          # job kept running, the address looked valid, and nothing was listening on it. Measured -
+          # the ngrok port refused connections from outside while this job was still "in progress".
+          #
+          # So the tunnel has to live in the same step that waits.
+          if ('${{ inputs.tunnel }}' -eq 'ngrok') {
+            $ng = Join-Path $env:GITHUB_WORKSPACE 'ngrok\ngrok.exe'
+            if (-not (Test-Path $ng)) { throw "ngrok.exe missing - the tunnel step should have unpacked it" }
+            if (-not (Get-Process ngrok -EA SilentlyContinue)) {
+              Start-Process $ng -ArgumentList 'tcp','3389','--log','stdout' -RedirectStandardOutput ngrok2.log -WindowStyle Hidden
+              Start-Sleep 8
+            }
+            $addr = ''
+            foreach ($i in 1..20) {
+              try { $addr = ((Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url) -replace '^tcp://','' } catch {}
+              if ($addr) { break }
+              Start-Sleep 3
+            }
+            if (-not $addr) { Get-Content ngrok2.log -EA SilentlyContinue; throw "ngrok gave no public address" }
+            "";  "=========================================================="
+            "  CONNECT TO: $addr"
+            "  user: $env:USERNAME   password: the RDP_PASSWORD secret"
+            "  mstsc /v:$addr"
+            "=========================================================="; ""
+          }
+
+          # Heartbeat every 5 minutes: shows the job is healthy, how long is left, and - the part
+          # that would have caught the bug above - whether the tunnel process is still alive.
           $end = (Get-Date).AddMinutes([int]'${{ inputs.minutes }}')
           while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 300
             $left = [int]($end - (Get-Date)).TotalMinutes
-            $rdp = @(Get-Process rdpclip, TabTip -EA SilentlyContinue).Count
+            $tun = @(Get-Process ngrok, tailscaled -EA SilentlyContinue).Count
             $skipper = @(Get-Process Skipper -EA SilentlyContinue).Count
-            "{0}  {1} min left   skipper running: {2}" -f (Get-Date -Format HH:mm:ss), $left, $skipper
+            "{0}  {1} min left   tunnel procs: {2}   skipper: {3}" -f (Get-Date -Format HH:mm:ss), $left, $tun, $skipper
           }
           "time is up"
 
