@@ -142,10 +142,23 @@ jobs:
             $ts = 'C:\Program Files\Tailscale\tailscale.exe'
             if (-not (Test-Path $ts)) { throw "tailscale.exe not found after install" }
 
+            # tailscaled has been seen to sit in "state: NoState / Tailscale is starting" for five
+            # minutes even though `up` returned 0 - the service starts before it is really ready and
+            # then never converges. Restart it now that the binaries are in place, and wait for the
+            # backend to leave NoState BEFORE logging in; that ordering is what avoids the hang.
+            Restart-Service Tailscale -Force -EA SilentlyContinue
+            foreach ($i in 1..20) {
+              $st = (& $ts status 2>&1 | Out-String)
+              if ($st -notmatch 'NoState' -and $st -notmatch 'Tailscale is starting') { break }
+              Start-Sleep 3
+            }
+            "backend before login: $((& $ts status 2>&1 | Select-Object -First 1))"
+
+            # --reset clears half-finished state left by an earlier attempt on this machine.
             # Keep the output: an expired or already-used auth key only shows up here.
             # --timeout: without it `up` blocks forever waiting for an interactive login when the
             # key is refused, and the job sits there until the 6h cap instead of failing.
-            $up = & $ts up --authkey=$env:TS_KEY --hostname=skipper-arm-runner --accept-routes --timeout=90s 2>&1
+            $up = & $ts up --reset --authkey=$env:TS_KEY --hostname=skipper-arm-runner --accept-routes --timeout=120s 2>&1
             "tailscale up exit=$LASTEXITCODE"
             $up | ForEach-Object { "  $_" }
 
