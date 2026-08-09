@@ -1,0 +1,192 @@
+# Hand the ARM64 runner over for interactive use: RDP in, drive Skipper by hand.
+#
+# The automated GUI test proves the window comes up and paints. It cannot open a project, walk a
+# diagram, run an export or judge whether the thing is usable. That needs a keyboard.
+#
+# The runner already has a real desktop - measured: session 2, UserInteractive True, 1024x768 - so
+# only two things are missing: the RDP service, and a way to reach a machine that has no public
+# address. The tunnel provides the second.
+#
+# TAILSCALE IS THE DEFAULT and the safer one: the runner joins your private tailnet and is reachable
+# only from your own devices. ngrok is the fallback - it publishes a public TCP address, and this is
+# a PUBLIC repository, so that address ends up in a world-readable log. With ngrok the password is
+# the only thing standing in front of the machine; keep it strong and keep the session short.
+#
+# Either way the password comes from a secret and never from the log.
+name: skipper-arm-win-rdp
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel:
+        description: Which tunnel to use
+        required: true
+        default: tailscale
+        type: choice
+        options: [tailscale, ngrok]
+      version:
+        description: Skipper version to install
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding the installer and clang binaries
+        required: true
+        default: "arm-test-3.5.1.1884"
+      asset:
+        description: Zip with the clang-built executables (empty = package as shipped)
+        required: false
+        default: "skipper-clang-arm64.zip"
+      minutes:
+        description: How long to keep the session open (max 340)
+        required: false
+        default: "120"
+
+jobs:
+  rdp:
+    runs-on: windows-11-arm
+    # GitHub caps a job at 6 h; leave headroom so the cleanup step still runs.
+    timeout-minutes: 350
+
+    steps:
+      - name: Check the secrets are in place
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (-not "${{ secrets.RDP_PASSWORD }}") { $missing += 'RDP_PASSWORD' }
+          if ('${{ inputs.tunnel }}' -eq 'tailscale' -and -not "${{ secrets.TAILSCALE_AUTHKEY }}") { $missing += 'TAILSCALE_AUTHKEY' }
+          if ('${{ inputs.tunnel }}' -eq 'ngrok'     -and -not "${{ secrets.NGROK_AUTHTOKEN }}")  { $missing += 'NGROK_AUTHTOKEN' }
+          if ($missing.Count) { throw "missing repository secret(s): $($missing -join ', ')" }
+          "secrets present for the ${{ inputs.tunnel }} tunnel"
+
+      - name: Enable RDP and set the password
+        shell: powershell
+        env:
+          PW: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # NLA off: the account is local and some clients otherwise refuse the handshake.
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -EA SilentlyContinue
+          Start-Service TermService -EA SilentlyContinue
+          Set-Service   TermService -StartupType Automatic -EA SilentlyContinue
+
+          # The password travels in the environment so it is never on a command line.
+          $u = $env:USERNAME
+          net user $u $env:PW | Out-Null
+          # An account with no password set cannot log on over RDP at all; also make sure it is in
+          # the group RDP checks.
+          net localgroup "Remote Desktop Users" $u /add 2>$null | Out-Null
+          "RDP enabled for user: $u"
+          (Get-Service TermService).Status
+
+      - name: Install Skipper and put it on the desktop
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer.exe "$base/Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = 'C:\Skipper'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+
+          if ($env:ASSET) {
+            curl.exe -L -f -o clang.zip "$base/$env:ASSET"
+            if ($LASTEXITCODE -eq 0) {
+              Expand-Archive clang.zip -DestinationPath clang -Force
+              $exe = Get-ChildItem clang -Recurse -Filter 'Skipper.exe' | Select-Object -First 1
+              Copy-Item $exe.FullName (Join-Path $dir 'Skipper.exe') -Force
+              Get-ChildItem clang -Recurse -Include '*.dll' | ForEach-Object { Copy-Item $_.FullName $dir -Force }
+              "clang build swapped in"
+            }
+          }
+
+          # A shortcut on the desktop, so there is something to double-click after logging in.
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          $sc = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\Skipper.lnk")
+          $sc.TargetPath = "$dir\Skipper.exe"
+          $sc.WorkingDirectory = $dir
+          $sc.Save()
+          "installed to $dir, shortcut on the desktop"
+
+      - name: Start the tunnel
+        id: tunnel
+        shell: pwsh
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          NGROK_TOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if ('${{ inputs.tunnel }}' -eq 'tailscale') {
+            curl.exe -L -f -o ts.msi "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi"
+            if ($LASTEXITCODE -ne 0) { throw "tailscale download failed" }
+            Start-Process msiexec.exe -ArgumentList '/i','ts.msi','/quiet','/norestart' -Wait
+            $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+            & $ts up --authkey=$env:TS_KEY --hostname=skipper-arm-runner --accept-routes
+            Start-Sleep 5
+            $ip = (& $ts ip -4) -join ''
+            "CONNECT TO: $ip   (tailscale hostname: skipper-arm-runner)"
+            "addr=$ip" | Out-File -Append $env:GITHUB_OUTPUT
+          } else {
+            curl.exe -L -f -o ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip"
+            if ($LASTEXITCODE -ne 0) { throw "ngrok download failed" }
+            Expand-Archive ngrok.zip -DestinationPath ngrok -Force
+            $ng = "$PWD\ngrok\ngrok.exe"
+            & $ng config add-authtoken $env:NGROK_TOKEN
+            Start-Process $ng -ArgumentList 'tcp','3389','--log','stdout' -RedirectStandardOutput ngrok.log -WindowStyle Hidden
+            Start-Sleep 8
+            # The public address is only available from ngrok's local API.
+            $t = (Invoke-RestMethod http://127.0.0.1:4040/api/tunnels).tunnels[0].public_url
+            $addr = $t -replace '^tcp://',''
+            "CONNECT TO: $addr"
+            "addr=$addr" | Out-File -Append $env:GITHUB_OUTPUT
+          }
+
+      - name: Connection details
+        shell: pwsh
+        run: |
+          ""
+          "=========================================================="
+          "  Remote Desktop is ready"
+          "=========================================================="
+          "  address : ${{ steps.tunnel.outputs.addr }}"
+          "  user    : $env:USERNAME"
+          "  password: the RDP_PASSWORD secret (not printed here)"
+          ""
+          "  mstsc /v:${{ steps.tunnel.outputs.addr }}"
+          ""
+          "  Skipper is installed in C:\Skipper with a shortcut on the desktop."
+          "  Licence: run  C:\Skipper\SkipperCli.exe -license-activate <key>"
+          "  or start Skipper.exe with  -license-key <key>"
+          ""
+          "  The session closes automatically after ${{ inputs.minutes }} minutes."
+          "  Cancel the workflow run when you are done to release it sooner."
+          "=========================================================="
+
+      - name: Hold the session open
+        shell: pwsh
+        run: |
+          # Just keeps the job alive. A heartbeat every 5 minutes so the log shows it is healthy and
+          # how much time is left.
+          $end = (Get-Date).AddMinutes([int]'${{ inputs.minutes }}')
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 300
+            $left = [int]($end - (Get-Date)).TotalMinutes
+            $rdp = @(Get-Process rdpclip, TabTip -EA SilentlyContinue).Count
+            $skipper = @(Get-Process Skipper -EA SilentlyContinue).Count
+            "{0}  {1} min left   skipper running: {2}" -f (Get-Date -Format HH:mm:ss), $left, $skipper
+          }
+          "time is up"
+
+      - name: Release the machine
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (Test-Path $ts) { & $ts logout; "tailscale logged out" }
+          Get-Process ngrok -EA SilentlyContinue | Stop-Process -Force
+          $cli = 'C:\Skipper\SkipperCli.exe'
+          if (Test-Path $cli) { & $cli -license-unregister 2>$null; "licence released" }
