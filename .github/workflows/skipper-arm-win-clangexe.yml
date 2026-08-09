@@ -120,6 +120,9 @@ jobs:
           Probe 'cli-licensed'   'SkipperCli.exe' @('-license-key', $env:KEY, '-cli-list-orm-attributes')
           Probe 'selfcheck'      'Skipper.exe'    @('--self-check')
           Probe 'cli-help'       'SkipperCli.exe' @('-cli-help')
+          # -self-check on the CLI binary, not Skipper.exe --self-check: the GUI binary does not
+          # match the two-dash form and just exits 1 without printing, on every platform.
+          Probe 'selfcheck-cli'  'SkipperCli.exe' @('-self-check')
 
       - name: Stack of anything that still crashed
         if: always()
