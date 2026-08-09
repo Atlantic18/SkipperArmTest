@@ -206,6 +206,23 @@ jobs:
       - name: Connection details
         shell: pwsh
         run: |
+          # ALSO to the step summary. The job log is only published when the whole run ends,
+          # and this run deliberately stays alive for hours - so the log is useless for
+          # telling anyone the address. The summary shows up immediately.
+          $md = @(
+            "## Remote Desktop ready",
+            "",
+            "| | |",
+            "|---|---|",
+            "| address | ``${{ steps.tunnel.outputs.addr }}`` |",
+            "| user | ``$env:USERNAME`` |",
+            "| password | the RDP_PASSWORD secret |",
+            "",
+            "``mstsc /v:${{ steps.tunnel.outputs.addr }}``",
+            "",
+            "Skipper is in ``C:\Skipper`` with a desktop shortcut. Cancel this run when done."
+          ) -join [Environment]::NewLine
+          $md | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           ""
           "=========================================================="
           "  Remote Desktop is ready"
