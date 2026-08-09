@@ -1,0 +1,190 @@
+# Does the Skipper GUI actually come up on ARM64?
+#
+# The CLI self-check proves the engine works, but it never creates a window: no QMainWindow, no
+# QtitanRibbon, no styles, no painting. That is the layer where the very first ARM64 crash lived
+# (QApplication -> QObjectPrivate::addConnection), so it deserves its own test.
+#
+# This runs the real GUI binary, waits for it to settle, then proves it is alive three ways:
+#   - the process is still running and has a MainWindowTitle
+#   - EnumWindows lists its top-level windows with their captions and sizes
+#   - a screenshot of the desktop is captured and uploaded
+#
+# Whether a GitHub-hosted runner has a usable desktop is itself unknown, so the job reports what it
+# finds instead of assuming: if there is no interactive session the window enumeration still works
+# and only the screenshot will be blank.
+name: skipper-arm-win-gui
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Skipper version of the base package
+        required: true
+        default: "3.5.1.1884"
+      tag:
+        description: Release tag holding the installer and the clang binaries
+        required: true
+        default: "arm-test-3.5.1.1884"
+      asset:
+        description: Zip with the clang-built executables (empty = test the package as shipped)
+        required: false
+        default: "skipper-clang-arm64.zip"
+      seconds:
+        description: How long to let the GUI run before looking at it
+        required: false
+        default: "40"
+
+jobs:
+  gui:
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Report what kind of session this is
+        shell: pwsh
+        run: |
+          # A screenshot needs an interactive window station; session 0 has none. Worth knowing
+          # up front so a blank image is not mistaken for a failed application.
+          "user            : $env:USERNAME"
+          "session id      : $((Get-Process -Id $PID).SessionId)"
+          "interactive     : $([Environment]::UserInteractive)"
+          Add-Type -AssemblyName System.Windows.Forms
+          $s = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          "virtual screen  : $($s.Width) x $($s.Height) at $($s.X),$($s.Y)"
+
+      - name: Install the base package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o installer.exe "$base/Skipper-$env:VERSION-Windows-all-arm-64bit.exe"
+          if ($LASTEXITCODE -ne 0) { throw "installer download failed" }
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $p = Start-Process -FilePath .\installer.exe -ArgumentList "/S","/INSTDIR=$dir" -PassThru
+          if (-not $p.WaitForExit(300000)) { $p.Kill(); throw "installer hung" }
+          if (-not (Test-Path (Join-Path $dir 'Skipper.exe'))) { throw "Skipper.exe not installed" }
+          "installed OK"
+
+      - name: Swap in the clang build
+        if: inputs.asset != ''
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+          ASSET: ${{ inputs.asset }}
+        run: |
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:TAG"
+          curl.exe -L -f -o clang.zip "$base/$env:ASSET"
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Expand-Archive clang.zip -DestinationPath clang -Force
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $exe = Get-ChildItem clang -Recurse -Filter 'Skipper.exe' | Select-Object -First 1
+          Copy-Item $exe.FullName (Join-Path $dir 'Skipper.exe') -Force
+          Get-ChildItem clang -Recurse -Include '*.dll','*.pdb' | ForEach-Object {
+            Copy-Item $_.FullName $dir -Force; "  $($_.Name)"
+          }
+          "swapped in the clang build"
+
+      - name: Start the GUI
+        id: start
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.SKIPPER_LICENSE_KEY }}
+        run: |
+          # -license-key so it does not stop on the "licence missing" modal - that dialog is exactly
+          # what made every earlier run look like a hang.
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'Installed'
+          $exe = Join-Path $dir 'Skipper.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '-license-key', $env:KEY -PassThru
+          "started pid $($p.Id)"
+          "pid=$($p.Id)" | Out-File -Append $env:GITHUB_OUTPUT
+          Start-Sleep -Seconds ([int]'${{ inputs.seconds }}')
+          if ($p.HasExited) {
+            "PROCESS DIED - exit $($p.ExitCode) (0x{0:X8})" -f $p.ExitCode
+            throw "the GUI process exited on its own"
+          }
+          "still running after ${{ inputs.seconds }}s"
+
+      - name: List its windows
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # MainWindowTitle comes from the process itself; EnumWindows is the independent check,
+          # since a process can be alive with no window at all.
+          $p = Get-Process -Id ${{ steps.start.outputs.pid }} -EA SilentlyContinue
+          if (-not $p) { throw "process gone" }
+          "MainWindowTitle : '$($p.MainWindowTitle)'"
+          "MainWindowHandle: $($p.MainWindowHandle)"
+          "threads         : $($p.Threads.Count)"
+          "working set     : {0:N1} MB" -f ($p.WorkingSet64/1MB)
+
+          Add-Type @'
+          using System;
+          using System.Text;
+          using System.Collections.Generic;
+          using System.Runtime.InteropServices;
+          public class Win {
+            [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+            [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+            [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+            [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+            [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+            public struct RECT { public int L, T, R, B; }
+            delegate bool EnumProc(IntPtr h, IntPtr p);
+            public static List<string> ForPid(uint want) {
+              var res = new List<string>();
+              EnumWindows((h, p) => {
+                uint pid; GetWindowThreadProcessId(h, out pid);
+                if (pid != want) return true;
+                var t = new StringBuilder(512); GetWindowText(h, t, 512);
+                var c = new StringBuilder(512); GetClassName(h, c, 512);
+                RECT r; GetWindowRect(h, out r);
+                res.Add(string.Format("visible={0,-5} {1,5}x{2,-5} class={3,-24} title='{4}'",
+                        IsWindowVisible(h), r.R - r.L, r.B - r.T, c, t));
+                return true;
+              }, IntPtr.Zero);
+              return res;
+            }
+          }
+'@
+          $w = [Win]::ForPid([uint32]${{ steps.start.outputs.pid }})
+          if ($w.Count -eq 0) { "NO TOP-LEVEL WINDOWS FOUND" }
+          else { "top-level windows: $($w.Count)"; $w | ForEach-Object { "  $_" } }
+
+      - name: Screenshot
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+          $s = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($s.X, $s.Y, 0, 0, $bmp.Size)
+          $bmp.Save("$env:GITHUB_WORKSPACE\skipper-gui.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $g.Dispose(); $bmp.Dispose()
+          $f = Get-Item "$env:GITHUB_WORKSPACE\skipper-gui.png"
+          "screenshot: {0:N0} bytes" -f $f.Length
+
+      - name: Close it down
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $p = Get-Process -Id ${{ steps.start.outputs.pid }} -EA SilentlyContinue
+          if ($p) {
+            $p.CloseMainWindow() | Out-Null
+            if (-not $p.WaitForExit(15000)) { $p.Kill(); "killed" } else { "closed cleanly, exit $($p.ExitCode)" }
+          } else { "already gone" }
+          $cli = Join-Path $env:GITHUB_WORKSPACE 'Installed\SkipperCli.exe'
+          if (Test-Path $cli) { & $cli -license-unregister; "unregister exit $LASTEXITCODE" }
+
+      - name: Collect
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipper-arm-gui
+          path: |
+            skipper-gui.png
+          if-no-files-found: warn
