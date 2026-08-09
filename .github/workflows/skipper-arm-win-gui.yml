@@ -119,36 +119,40 @@ jobs:
           "threads         : $($p.Threads.Count)"
           "working set     : {0:N1} MB" -f ($p.WorkingSet64/1MB)
 
-          Add-Type @'
-          using System;
-          using System.Text;
-          using System.Collections.Generic;
-          using System.Runtime.InteropServices;
-          public class Win {
-            [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
-            [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-            [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-            [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-            [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-            [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
-            public struct RECT { public int L, T, R, B; }
-            delegate bool EnumProc(IntPtr h, IntPtr p);
-            public static List<string> ForPid(uint want) {
-              var res = new List<string>();
-              EnumWindows((h, p) => {
-                uint pid; GetWindowThreadProcessId(h, out pid);
-                if (pid != want) return true;
-                var t = new StringBuilder(512); GetWindowText(h, t, 512);
-                var c = new StringBuilder(512); GetClassName(h, c, 512);
-                RECT r; GetWindowRect(h, out r);
-                res.Add(string.Format("visible={0,-5} {1,5}x{2,-5} class={3,-24} title='{4}'",
-                        IsWindowVisible(h), r.R - r.L, r.B - r.T, c, t));
-                return true;
-              }, IntPtr.Zero);
-              return res;
-            }
-          }
-'@
+          # C# built as an array of lines, not a here-string: a PowerShell here-string has to be
+          # closed by '@ in column 1, which would terminate the YAML block scalar at the same time.
+          $src = @(
+            'using System;',
+            'using System.Text;',
+            'using System.Collections.Generic;',
+            'using System.Runtime.InteropServices;',
+            'public class Win {',
+            '  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);',
+            '  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+            '  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);',
+            '  [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder s, int n);',
+            '  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);',
+            '  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);',
+            '  public struct RECT { public int L, T, R, B; }',
+            '  delegate bool EnumProc(IntPtr h, IntPtr p);',
+            '  public static List<string> ForPid(uint want) {',
+            '    var res = new List<string>();',
+            '    EnumWindows((h, p) => {',
+            '      uint pid; GetWindowThreadProcessId(h, out pid);',
+            '      if (pid != want) return true;',
+            '      var t = new StringBuilder(512); GetWindowText(h, t, 512);',
+            '      var c = new StringBuilder(512); GetClassName(h, c, 512);',
+            '      RECT r; GetWindowRect(h, out r);',
+            '      res.Add(string.Format("visible={0,-5} {1,5}x{2,-5} class={3,-24} title=[{4}]",',
+            '              IsWindowVisible(h), r.R - r.L, r.B - r.T, c, t));',
+            '      return true;',
+            '    }, IntPtr.Zero);',
+            '    return res;',
+            '  }',
+            '}'
+          ) -join [Environment]::NewLine
+          Add-Type -TypeDefinition $src
+
           $w = [Win]::ForPid([uint32]${{ steps.start.outputs.pid }})
           if ($w.Count -eq 0) { "NO TOP-LEVEL WINDOWS FOUND" }
           else { "top-level windows: $($w.Count)"; $w | ForEach-Object { "  $_" } }
