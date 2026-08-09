@@ -147,16 +147,26 @@ jobs:
             "tailscale up exit=$LASTEXITCODE"
             $up | ForEach-Object { "  $_" }
 
-            # Joining the tailnet is not instant; poll instead of sleeping a fixed amount.
+            # Joining the tailnet is not instant, and if the tailnet has DEVICE APPROVAL enabled the
+            # login succeeds while the address is withheld until a human approves the machine in the
+            # admin console. That is indistinguishable from "slow" from here, so wait a long time and
+            # report status while waiting, giving someone a chance to click Approve.
             $ip = ''
-            foreach ($i in 1..30) {
-              $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-              if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
-              Start-Sleep 3
+            foreach ($i in 1..60) {
+              $raw = (& $ts ip -4 2>&1 | Select-Object -First 1)
+              if ("$raw" -match '(\d+\.\d+\.\d+\.\d+)') { $ip = $Matches[1]; break }
+              if ($i % 4 -eq 1) {
+                "waiting for an address ({0}/60) - last: {1}" -f $i, "$raw".Trim()
+                (& $ts status 2>&1 | Select-Object -First 3) | ForEach-Object { "    $_" }
+              }
+              Start-Sleep 5
             }
-            if ($ip -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            if (-not $ip) {
+              "--- tailscale status ---"
               & $ts status 2>&1 | ForEach-Object { "  $_" }
-              throw "no Tailscale IP after 90s - check whether the auth key is valid and unused"
+              "--- tailscale netcheck ---"
+              & $ts netcheck 2>&1 | Select-Object -First 12 | ForEach-Object { "  $_" }
+              throw "no Tailscale IP after 5 minutes. If your tailnet requires device approval, approve 'skipper-arm-runner' in the admin console while this step is waiting."
             }
             "CONNECT TO: $ip   (tailscale hostname: skipper-arm-runner)"
             "addr=$ip" | Out-File -Append $env:GITHUB_OUTPUT
