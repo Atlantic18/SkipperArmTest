@@ -139,7 +139,7 @@ jobs:
             if ($svc.Status -ne 'Running') { Start-Service Tailscale; Start-Sleep 3 }
             "service: $((Get-Service Tailscale).Status)"
 
-            $ts = 'C:\Program Files\Tailscale	ailscale.exe'
+            $ts = 'C:\Program Files\Tailscale\tailscale.exe'
             if (-not (Test-Path $ts)) { throw "tailscale.exe not found after install" }
 
             # Keep the output: an expired or already-used auth key only shows up here.
@@ -164,9 +164,7 @@ jobs:
             curl.exe -L -f -o ngrok.zip "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip"
             if ($LASTEXITCODE -ne 0) { throw "ngrok download failed" }
             Expand-Archive ngrok.zip -DestinationPath ngrok -Force
-            $ng = "$PWD
-grok
-grok.exe"
+            $ng = Join-Path $PWD 'ngrok\ngrok.exe'
             & $ng config add-authtoken $env:NGROK_TOKEN
             Start-Process $ng -ArgumentList 'tcp','3389','--log','stdout' -RedirectStandardOutput ngrok.log -WindowStyle Hidden
             $addr = ''
