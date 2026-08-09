@@ -161,15 +161,52 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
+          # TWO images on purpose. The full-desktop grab is the obvious one, but this runner boots
+          # into the Windows out-of-box experience, which sits on top of everything and is all a
+          # desktop grab shows. PrintWindow asks the window itself to render, so it captures
+          # Skipper even when something else is in front of it.
           Add-Type -AssemblyName System.Drawing, System.Windows.Forms
+          $src = @(
+            'using System;',
+            'using System.Drawing;',
+            'using System.Runtime.InteropServices;',
+            'public class Shot {',
+            '  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);',
+            '  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);',
+            '  public struct RECT { public int L, T, R, B; }',
+            '  public static Bitmap Grab(IntPtr h) {',
+            '    RECT r; GetWindowRect(h, out r);',
+            '    int w = r.R - r.L, ht = r.B - r.T;',
+            '    if (w <= 0 || ht <= 0) return null;',
+            '    var bmp = new Bitmap(w, ht);',
+            '    using (var g = Graphics.FromImage(bmp)) {',
+            '      IntPtr dc = g.GetHdc();',
+            '      PrintWindow(h, dc, 2);',   
+            '      g.ReleaseHdc(dc);',
+            '    }',
+            '    return bmp;',
+            '  }',
+            '}'
+          ) -join [Environment]::NewLine
+          Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing
+
+          $p = Get-Process -Id ${{ steps.start.outputs.pid }} -EA SilentlyContinue
+          if ($p -and $p.MainWindowHandle -ne 0) {
+            $bmp = [Shot]::Grab($p.MainWindowHandle)
+            if ($bmp) {
+              $bmp.Save("$env:GITHUB_WORKSPACE\skipper-window.png", [System.Drawing.Imaging.ImageFormat]::Png)
+              $bmp.Dispose()
+              "window shot : {0:N0} bytes ({1})" -f (Get-Item "$env:GITHUB_WORKSPACE\skipper-window.png").Length, $p.MainWindowTitle
+            } else { "window had no usable size" }
+          } else { "no main window handle to capture" }
+
           $s = [System.Windows.Forms.SystemInformation]::VirtualScreen
           $bmp = New-Object System.Drawing.Bitmap($s.Width, $s.Height)
           $g = [System.Drawing.Graphics]::FromImage($bmp)
           $g.CopyFromScreen($s.X, $s.Y, 0, 0, $bmp.Size)
-          $bmp.Save("$env:GITHUB_WORKSPACE\skipper-gui.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Save("$env:GITHUB_WORKSPACE\skipper-desktop.png", [System.Drawing.Imaging.ImageFormat]::Png)
           $g.Dispose(); $bmp.Dispose()
-          $f = Get-Item "$env:GITHUB_WORKSPACE\skipper-gui.png"
-          "screenshot: {0:N0} bytes" -f $f.Length
+          "desktop shot: {0:N0} bytes" -f (Get-Item "$env:GITHUB_WORKSPACE\skipper-desktop.png").Length
 
       - name: Close it down
         if: always()
@@ -190,5 +227,6 @@ jobs:
         with:
           name: skipper-arm-gui
           path: |
-            skipper-gui.png
+            skipper-window.png
+            skipper-desktop.png
           if-no-files-found: warn
