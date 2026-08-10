@@ -26,9 +26,9 @@ on:
         required: true
         default: "arm-test-3.5.1.1884"
       asset:
-        description: Zip with the clang-built executables
-        required: true
-        default: "skipper-clang-arm64.zip"
+        description: Zip with the clang-built executables (empty = test the package exactly as shipped)
+        required: false
+        default: ""
 
 jobs:
   clangexe:
@@ -52,6 +52,7 @@ jobs:
           "installed OK"
 
       - name: Swap in the clang-built executables
+        if: inputs.asset != ''
         shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
