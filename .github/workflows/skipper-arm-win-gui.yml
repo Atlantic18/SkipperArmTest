@@ -28,7 +28,9 @@ on:
       asset:
         description: Zip with the clang-built executables (empty = test the package as shipped)
         required: false
-        default: "skipper-clang-arm64.zip"
+        # Empty by default: testing the shipped package is now the normal case, and passing an empty
+        # value on the command line does NOT override a non-empty default - GitHub keeps the default.
+        default: ""
       seconds:
         description: How long to let the GUI run before looking at it
         required: false
